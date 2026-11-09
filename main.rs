@@ -163,15 +163,38 @@ fn cmd_install(paths: &Paths, game: &str, windows_only: bool) -> Result<()> {
     let title = api.game_title(id)?.unwrap_or_else(|| format!("game {id}"));
     let payload = api.packages(id)?;
     let Some(choice) = select::choose(&payload, windows_only) else {
-        bail!("{title} has no installable Linux or Windows archive build (Joltux supports .zip and .tar.gz archives, not raw executables or installers)");
+        bail!(
+            "{title} has no installable Linux or Windows build (Joltux supports .zip and .tar.gz archives, plus standalone Windows .exe files; installers are not supported)"
+        );
     };
     let version = choice.release.map(|r| r.version_number.clone()).unwrap_or_default();
     println!("Installing {title}: build {} ({})", choice.build.id, describe(choice.platform));
 
-    // Work out what to launch before downloading, so we fail early if the
-    // game has no launch information.
-    let Some(option) = select::launch_option(&payload.launch_options, choice.build.id, choice.platform) else {
-        bail!("build {} has no launch option for this platform", choice.build.id);
+    let standalone_exe = choice.platform == Platform::Windows
+        && choice
+            .build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.is_archive)
+            == Some(false)
+        && select::is_standalone_windows_executable(choice.build);
+    let executable_path = if standalone_exe {
+        choice
+            .build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.filename.clone())
+            .context("standalone Windows build has no filename")?
+    } else {
+        select::launch_option(&payload.launch_options, choice.build.id, choice.platform)
+            .map(|option| option.executable_path.clone())
+            .filter(|path| !path.is_empty())
+            .with_context(|| {
+                format!(
+                    "build {} has no launch path for this platform",
+                    choice.build.id
+                )
+            })?
     };
 
     let url = api.download_url(choice.build.id)?;
@@ -182,13 +205,18 @@ fn cmd_install(paths: &Paths, game: &str, windows_only: bool) -> Result<()> {
     if dir.exists() {
         fs::remove_dir_all(&dir).context("could not clear the previous install")?;
     }
-    println!("Extracting...");
-    let extracted = install::extract(&archive, &dir, &choice.build.archive_type);
-    let _ = fs::remove_file(&archive); // the archive is no longer needed either way
-    extracted?;
-
-    let executable = install::find_executable(&dir, &option.executable_path)
-        .with_context(|| format!("installed, but could not find `{}` in the archive", option.executable_path))?;
+    let executable = if standalone_exe {
+        install::install_raw_executable(&archive, &dir, &executable_path)?
+    } else {
+        println!("Extracting...");
+        let extracted = install::extract(&archive, &dir, &choice.build.archive_type);
+        let _ = fs::remove_file(&archive); // the archive is no longer needed either way
+        extracted?;
+        install::find_executable(&dir, &executable_path)
+            .with_context(|| {
+                format!("installed, but could not find `{executable_path}` in the archive")
+            })?
+    };
 
     let mut library = Library::load(paths)?;
     library.upsert(InstalledGame {

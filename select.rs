@@ -2,7 +2,8 @@
 //!
 //! Policy: prefer a native Linux build (fast, no compatibility layer). Fall
 //! back to a Windows build that will run through Proton/Wine. Browser builds,
-//! raw files, installers, removed builds and macOS-only builds are never chosen.
+//! non-executable raw files, installers, removed builds and macOS-only builds
+//! are never chosen.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,16 +44,34 @@ fn classify(build: &Build, windows_only: bool) -> Option<(Platform, u8)> {
     None
 }
 
+pub fn is_standalone_windows_executable(build: &Build) -> bool {
+    (build.os_windows || build.os_windows_64)
+        && build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.filename.as_deref())
+            .is_some_and(|filename| filename.to_ascii_lowercase().ends_with(".exe"))
+}
+
 /// Every installable build, best first. With `windows_only` set, native Linux
 /// builds are ignored (useful when the Linux build is broken).
 pub fn candidates(payload: &PackagePayload, windows_only: bool) -> Vec<Choice<'_>> {
     let mut out: Vec<Choice<'_>> = payload
         .builds
         .iter()
-        .filter(|b| b.is_downloadable() && b.is_active() && !b.is_installer)
-        .filter(|b| b.primary_file.as_ref().and_then(|file| file.is_archive) != Some(false))
         .filter_map(|build| {
+            if !build.is_downloadable() || !build.is_active() || build.is_installer {
+                return None;
+            }
             let (platform, rank) = classify(build, windows_only)?;
+            let is_standalone_exe = platform == Platform::Windows
+                && build.primary_file.as_ref().and_then(|file| file.is_archive) == Some(false)
+                && is_standalone_windows_executable(build);
+            if build.primary_file.as_ref().and_then(|file| file.is_archive) == Some(false)
+                && !is_standalone_exe
+            {
+                return None;
+            }
             let release = payload
                 .releases
                 .iter()
@@ -117,7 +136,7 @@ mod tests {
                  "status": "removed", "os_linux_64": true},
                 {"id": 104, "game_package_id": 1, "game_release_id": 10, "type": "downloadable",
                  "status": "active", "os_windows_64": true,
-                 "primary_file": {"filename": "game.exe", "is_archive": false}}
+                 "primary_file": {"filename": "game.bin", "is_archive": false}}
               ],
               "launchOptions": [
                 {"game_build_id": 100, "os": "windows_64", "executable_path": "Game.exe"},
@@ -158,4 +177,27 @@ mod tests {
         assert_eq!(lo.executable_path, "Game.exe");
         assert!(launch_option(&p.launch_options, 100, Platform::Linux).is_none());
     }
+
+        #[test]
+        fn accepts_standalone_windows_executable_without_launch_path() {
+                let payload: PackagePayload = serde_json::from_str(
+                        r#"{
+                            "builds": [{
+                                "id": 731959, "type": "downloadable", "status": "active",
+                                "os_windows": true, "os_windows_64": true, "is_installer": false,
+                                "primary_file": {
+                                    "filename": "five-nights-at-candy-s-remastered.exe",
+                                    "is_archive": false
+                                }
+                            }],
+                            "launchOptions": [{"game_build_id": 731959, "os": null, "executable_path": null}]
+                        }"#,
+                )
+                .unwrap();
+
+                let choice = choose(&payload, false).unwrap();
+                assert_eq!(choice.build.id, 731959);
+                assert_eq!(choice.platform, Platform::Windows);
+                assert!(is_standalone_windows_executable(choice.build));
+        }
 }

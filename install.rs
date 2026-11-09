@@ -96,6 +96,28 @@ pub fn extract(archive: &Path, dest: &Path, archive_type_hint: &str) -> Result<(
     }
 }
 
+pub fn install_raw_executable(download: &Path, dest: &Path, filename: &str) -> Result<PathBuf> {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || !filename.to_ascii_lowercase().ends_with(".exe")
+    {
+        bail!("unsafe standalone executable filename `{filename}`");
+    }
+
+    fs::create_dir_all(dest)?;
+    let executable = dest.join(filename);
+    fs::rename(download, &executable).with_context(|| {
+        format!(
+            "could not move downloaded executable to {}",
+            executable.display()
+        )
+    })?;
+    Ok(executable)
+}
+
 fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?).context("not a valid zip file")?;
     for i in 0..zip.len() {
@@ -218,6 +240,23 @@ mod tests {
         // Case-insensitive file-name fallback.
         assert!(find_executable(&root, "game.EXE").is_some());
         assert!(find_executable(&root, "missing.exe").is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn installs_standalone_executable_and_rejects_unsafe_names() {
+        let root = scratch("raw-exe");
+        let download = root.join("download.archive");
+        fs::write(&download, b"windows executable").unwrap();
+
+        let executable = install_raw_executable(&download, &root.join("out"), "game.exe").unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), b"windows executable");
+        assert!(!download.exists());
+
+        let download = root.join("another-download.archive");
+        fs::write(&download, b"executable").unwrap();
+        assert!(install_raw_executable(&download, &root.join("out"), "../evil.exe").is_err());
+        assert!(download.exists());
         let _ = fs::remove_dir_all(&root);
     }
 

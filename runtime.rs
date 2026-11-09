@@ -13,8 +13,7 @@ use crate::paths::Paths;
 
 const UMU_RELEASE_URL: &str =
     "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest";
-const UMU_ARCHIVE_URL: &str =
-    "https://github.com/Open-Wine-Components/umu-launcher/archive/refs/tags";
+const UMU_GIT_URL: &str = "https://github.com/Open-Wine-Components/umu-launcher.git";
 
 #[derive(Debug, Deserialize)]
 struct LatestRelease {
@@ -175,6 +174,9 @@ fn install_umu(paths: &Paths) -> Result<PathBuf> {
     if !command_exists("python3") {
         bail!("Python 3 is required to install umu-launcher into a user-local environment");
     }
+    if !command_exists("git") {
+        bail!("Git is required to install umu-launcher from its official release tag");
+    }
     fs::create_dir_all(&paths.runtimes_dir)?;
     let environment = paths.runtimes_dir.join("umu");
     run_checked(
@@ -183,12 +185,12 @@ fn install_umu(paths: &Paths) -> Result<PathBuf> {
     )?;
 
     let python = environment.join("bin/python");
-    let archive_url = format!("{UMU_ARCHIVE_URL}/{}.tar.gz", release.tag_name);
+    let release_source = format!("git+{UMU_GIT_URL}@{}", release.tag_name);
     run_checked(
         Command::new(&python)
             .args(["-m", "pip", "install", "--upgrade"])
-            .arg(archive_url),
-        "could not install umu-launcher from its official GitHub release",
+            .arg(release_source),
+        "could not install umu-launcher from its official GitHub release tag",
     )?;
 
     let executable = environment.join("bin/umu-run");

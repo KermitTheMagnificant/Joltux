@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderValue, COOKIE, SET_COOKIE};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::models::PackagePayload;
+use crate::models::{GameSearchPayload, PackagePayload};
 
 pub const USER_AGENT: &str = concat!("Joltux/", env!("CARGO_PKG_VERSION"), " (unofficial Linux launcher)");
 const BASE: &str = "https://gamejolt.com/site-api";
@@ -52,18 +52,24 @@ impl ApiClient {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        let url = format!("{BASE}{path}");
+        let url =
+            reqwest::Url::parse(&format!("{BASE}{path}")).context("invalid Game Jolt API URL")?;
+        self.get_url(url)
+    }
+
+    fn get_url(&self, url: reqwest::Url) -> Result<Value> {
+        let url_text = url.to_string();
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .send()
-            .with_context(|| format!("GET {url} failed"))?;
+            .with_context(|| format!("GET {url_text} failed"))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             bail!("not logged in (401). Set your session cookie: joltux config set session_cookie <value>");
         }
         if !status.is_success() {
-            bail!("GET {url} returned HTTP {status}");
+            bail!("GET {url_text} returned HTTP {status}");
         }
         Ok(Self::unwrap_payload(resp.json().context("response was not JSON")?))
     }
@@ -172,6 +178,21 @@ impl ApiClient {
             .pointer("/game/title")
             .and_then(Value::as_str)
             .map(str::to_owned))
+    }
+
+    /// Searches public games using the same route as the Game Jolt website.
+    pub fn search_games(&self, query: &str, page: u32) -> Result<GameSearchPayload> {
+        let mut url = reqwest::Url::parse(&format!("{BASE}/web/search/games"))
+            .context("invalid Game Jolt search URL")?;
+        {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("q", query);
+            if page > 1 {
+                query_pairs.append_pair("page", &page.to_string());
+            }
+        }
+        let payload = self.get_url(url)?;
+        serde_json::from_value(payload).context("unexpected shape for game search payload")
     }
 
     /// All packages, releases, builds and launch options for a game.

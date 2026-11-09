@@ -71,6 +71,43 @@ pub struct PackagePayload {
     pub launch_options: Vec<LaunchOption>,
 }
 
+/// Response of `GET /web/search/games`.
+#[derive(Debug, Default, Deserialize)]
+pub struct GameSearchPayload {
+    #[serde(default)]
+    pub games: Vec<GameSearchResult>,
+    #[serde(default, rename = "gamesCount")]
+    pub games_count: u64,
+    #[serde(default)]
+    pub page: u32,
+    #[serde(default, rename = "perPage")]
+    pub per_page: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameSearchResult {
+    #[serde(deserialize_with = "lenient_u64")]
+    pub id: u64,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub title: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub img_thumbnail: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub has_adult_content: bool,
+    #[serde(default)]
+    pub developer: Option<GameDeveloper>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameDeveloper {
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+}
+
 /// A "package" is a named group of releases (e.g. "Demo", "Full game").
 #[derive(Debug, Clone, Deserialize)]
 pub struct Package {
@@ -177,7 +214,40 @@ pub struct InstalledGame {
 
 #[cfg(test)]
 mod tests {
-    use super::PackagePayload;
+    use super::{GameSearchPayload, PackagePayload};
+
+    #[test]
+    fn parses_game_search_results_and_pagination() {
+        let payload: GameSearchPayload = serde_json::from_str(
+            r#"{
+                "games": [{
+                    "id": 123,
+                    "title": "Sample game",
+                    "slug": "sample-game",
+                    "img_thumbnail": "https://example.test/thumbnail.webp",
+                    "developer": {"display_name": "Studio", "username": "studio"},
+                    "unmodeled_field": true
+                }],
+                "gamesCount": 4518,
+                "page": 2,
+                "perPage": 36
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(payload.games_count, 4518);
+        assert_eq!(payload.page, 2);
+        assert_eq!(payload.per_page, 36);
+        assert_eq!(payload.games[0].id, 123);
+        assert_eq!(payload.games[0].title, "Sample game");
+        assert_eq!(
+            payload.games[0]
+                .developer
+                .as_ref()
+                .and_then(|developer| developer.display_name.as_deref()),
+            Some("Studio")
+        );
+    }
 
     #[test]
     fn parses_numeric_strings_in_package_payload() {

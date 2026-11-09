@@ -7,14 +7,20 @@ use eframe::egui;
 use crate::api::{ApiClient, LoginOutcome};
 use crate::config::{Config, Runner};
 use crate::library::Library;
-use crate::models::InstalledGame;
+use crate::models::{GameSearchPayload, GameSearchResult, InstalledGame};
 use crate::paths::Paths;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
+    Store,
     Library,
     Install,
+    Account,
     Settings,
+}
+
+enum StoreMessage {
+    Search(Result<GameSearchPayload, String>),
 }
 
 pub fn run() -> Result<()> {
@@ -39,8 +45,17 @@ struct JoltuxApp {
     config: Config,
     receiver: Receiver<String>,
     sender: Sender<String>,
+    store_receiver: Receiver<StoreMessage>,
+    store_sender: Sender<StoreMessage>,
     busy: bool,
     status: String,
+    store_query: String,
+    store_games: Vec<GameSearchResult>,
+    store_page: u32,
+    store_per_page: u32,
+    store_game_count: u64,
+    store_searching: bool,
+    store_error: Option<String>,
     game_input: String,
     windows_only: bool,
     remove_prefix: bool,
@@ -54,6 +69,8 @@ impl JoltuxApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
         let paths = Paths::discover()?;
         let (sender, receiver) = mpsc::channel();
+        let (store_sender, store_receiver) = mpsc::channel();
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::light();
         style.visuals.panel_fill = egui::Color32::from_rgb(246, 247, 244);
@@ -67,13 +84,22 @@ impl JoltuxApp {
         let config = Config::load(&paths)?;
         Ok(Self {
             paths,
-            page: Page::Library,
+            page: Page::Store,
             games,
             config,
             receiver,
             sender,
+            store_receiver,
+            store_sender,
             busy: false,
             status: String::new(),
+            store_query: String::new(),
+            store_games: Vec::new(),
+            store_page: 1,
+            store_per_page: 36,
+            store_game_count: 0,
+            store_searching: false,
+            store_error: None,
             game_input: String::new(),
             windows_only: false,
             remove_prefix: false,
@@ -140,6 +166,30 @@ impl JoltuxApp {
         self.start_task(move || login_task(username, password));
     }
 
+    fn search_store(&mut self, page: u32) {
+        let query = self.store_query.trim().to_owned();
+        if query.is_empty() || self.store_searching {
+            return;
+        }
+
+        self.store_searching = true;
+        self.store_error = None;
+        self.store_page = page.max(1);
+        if self.store_page == 1 {
+            self.store_games.clear();
+            self.store_game_count = 0;
+        }
+        let page = self.store_page;
+        let session_cookie = self.config.session_cookie.clone();
+        let sender = self.store_sender.clone();
+        std::thread::spawn(move || {
+            let result = ApiClient::new(session_cookie.as_deref())
+                .and_then(|api| api.search_games(&query, page))
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(StoreMessage::Search(result));
+        });
+    }
+
     fn refresh(&mut self) {
         match Library::load(&self.paths) {
             Ok(library) => self.games = library.games,
@@ -151,8 +201,163 @@ impl JoltuxApp {
         }
     }
 
+    fn store_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Discover games");
+        ui.add_space(8.0);
+
+        let mut search_requested = false;
+        ui.horizontal(|ui| {
+            let response = ui.add_enabled(
+                !self.store_searching,
+                egui::TextEdit::singleline(&mut self.store_query)
+                    .hint_text("Search Game Jolt games")
+                    .desired_width(360.0),
+            );
+            search_requested =
+                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            if ui
+                .add_enabled(
+                    !self.store_searching && !self.store_query.trim().is_empty(),
+                    egui::Button::new("Search"),
+                )
+                .clicked()
+            {
+                search_requested = true;
+            }
+            if self.store_searching {
+                ui.spinner();
+            }
+        });
+
+        if search_requested {
+            self.search_store(1);
+        }
+
+        if let Some(error) = &self.store_error {
+            ui.colored_label(egui::Color32::DARK_RED, error);
+        } else if self.store_games.is_empty() && !self.store_searching {
+            ui.add_space(12.0);
+            ui.label(if self.store_query.trim().is_empty() {
+                "Search for a game by title or keyword."
+            } else {
+                "No public games found for this search."
+            });
+        }
+
+        if !self.store_games.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} results", self.store_game_count));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let pages = self
+                        .store_game_count
+                        .div_ceil(u64::from(self.store_per_page.max(1)))
+                        .max(1) as u32;
+                    if ui
+                        .add_enabled(
+                            !self.store_searching && self.store_page < pages,
+                            egui::Button::new("Next"),
+                        )
+                        .clicked()
+                    {
+                        search_requested = true;
+                        self.store_page = self.store_page.saturating_add(1);
+                    }
+                    ui.label(format!("{} / {}", self.store_page, pages));
+                    if ui
+                        .add_enabled(
+                            !self.store_searching && self.store_page > 1,
+                            egui::Button::new("Previous"),
+                        )
+                        .clicked()
+                    {
+                        search_requested = true;
+                        self.store_page = self.store_page.saturating_sub(1);
+                    }
+                });
+            });
+        }
+
+        let mut review_game = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for game in self
+                .store_games
+                .iter()
+                .filter(|game| !game.has_adult_content)
+                .cloned()
+            {
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(thumbnail) = game
+                                .img_thumbnail
+                                .as_deref()
+                                .filter(|url| is_gamejolt_thumbnail(url))
+                            {
+                                ui.add(
+                                    egui::Image::from_uri(thumbnail)
+                                        .fit_to_exact_size(egui::vec2(144.0, 81.0)),
+                                );
+                            }
+                            ui.vertical(|ui| {
+                                ui.strong(&game.title);
+                                let developer = game
+                                    .developer
+                                    .as_ref()
+                                    .and_then(|developer| {
+                                        developer
+                                            .display_name
+                                            .as_ref()
+                                            .or(developer.username.as_ref())
+                                    })
+                                    .map(String::as_str)
+                                    .unwrap_or("Unknown creator");
+                                ui.small(format!("{developer}  ·  Game {}", game.id));
+                                if let Some(slug) = game.slug.as_deref() {
+                                    ui.hyperlink_to(
+                                        "Game Jolt page",
+                                        format!("https://gamejolt.com/games/{slug}/{}", game.id),
+                                    );
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Review builds").clicked() {
+                                        review_game = Some((game.id, game.title.clone()));
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
+
+        if search_requested && !self.store_searching {
+            self.search_store(self.store_page);
+        }
+        if let Some((game_id, title)) = review_game {
+            self.game_input = game_id.to_string();
+            self.windows_only = false;
+            self.page = Page::Install;
+            self.status = format!("Reviewing builds for {title}...");
+            self.run_cli(vec!["info".into(), game_id.to_string()]);
+        }
+    }
+
     fn library_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Your library");
+        ui.horizontal(|ui| {
+            ui.heading("Your library");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    self.refresh();
+                }
+            });
+        });
         ui.label(format!("{} installed", self.games.len()));
         ui.add_space(12.0);
 
@@ -259,6 +464,56 @@ impl JoltuxApp {
         ui.label("The native Linux build is selected by default when one is available.");
     }
 
+    fn account_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Game Jolt account");
+        ui.add_space(8.0);
+        ui.label(if self.config.session_cookie.is_some() {
+            "A Game Jolt session cookie is configured."
+        } else {
+            "Sign in to connect your Game Jolt account."
+        });
+        ui.add_space(12.0);
+
+        egui::Grid::new("account_login")
+            .num_columns(2)
+            .spacing([16.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Username");
+                ui.add(egui::TextEdit::singleline(&mut self.login_username).desired_width(280.0));
+                ui.end_row();
+
+                ui.label("Password");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.login_password)
+                        .password(true)
+                        .desired_width(280.0),
+                );
+                ui.end_row();
+            });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Log in"))
+                .clicked()
+            {
+                self.login();
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && self.config.session_cookie.is_some(),
+                    egui::Button::new("Log out"),
+                )
+                .clicked()
+            {
+                self.run_cli(vec!["logout".into()]);
+            }
+        });
+        ui.add_space(8.0);
+        ui.small("If login requires a CAPTCHA, sign in through your browser and enter the frontend cookie in Settings.");
+        ui.add_space(8.0);
+        ui.label(self.config.redacted());
+    }
+
     fn settings_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.add_space(8.0);
@@ -333,34 +588,6 @@ impl JoltuxApp {
                 self.run_cli(vec!["update".into()]);
             }
         });
-
-        ui.separator();
-        ui.heading("Game Jolt account");
-        ui.horizontal(|ui| {
-            ui.label("Username");
-            ui.add(egui::TextEdit::singleline(&mut self.login_username).desired_width(220.0));
-            ui.label("Password");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.login_password)
-                    .password(true)
-                    .desired_width(220.0),
-            );
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Log in"))
-                .clicked()
-            {
-                self.login();
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Log out"))
-                .clicked()
-            {
-                self.run_cli(vec!["logout".into()]);
-            }
-        });
-        ui.small("If login requires a CAPTCHA, sign in through your browser and enter the frontend cookie above.");
-        ui.add_space(8.0);
-        ui.label(self.config.redacted());
     }
 }
 
@@ -371,37 +598,53 @@ impl eframe::App for JoltuxApp {
             self.busy = false;
             self.refresh();
         }
-        if self.busy {
+        while let Ok(message) = self.store_receiver.try_recv() {
+            match message {
+                StoreMessage::Search(Ok(payload)) => {
+                    self.store_searching = false;
+                    self.store_games = payload.games;
+                    self.store_game_count = payload.games_count;
+                    self.store_page = payload.page.max(1);
+                    self.store_per_page = payload.per_page.max(1);
+                    self.store_error = None;
+                }
+                StoreMessage::Search(Err(error)) => {
+                    self.store_searching = false;
+                    self.store_games.clear();
+                    self.store_game_count = 0;
+                    self.store_error = Some(format!("Game search failed: {error}"));
+                }
+            }
+        }
+        if self.busy || self.store_searching {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .exact_width(176.0)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
                 ui.heading("Joltux");
-                ui.separator();
+                ui.add_space(20.0);
                 for (page, label) in [
+                    (Page::Store, "Store"),
                     (Page::Library, "Library"),
-                    (Page::Install, "Install"),
+                    (Page::Install, "Add a game"),
+                    (Page::Account, "Account"),
                     (Page::Settings, "Settings"),
                 ] {
                     if ui.selectable_label(self.page == page, label).clicked() {
                         self.page = page;
                     }
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Refresh library"))
-                        .clicked()
-                    {
-                        self.refresh();
-                    }
-                });
             });
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
+            Page::Store => self.store_page(ui),
             Page::Library => self.library_page(ui),
             Page::Install => self.install_page(ui),
+            Page::Account => self.account_page(ui),
             Page::Settings => self.settings_page(ui),
         });
 
@@ -440,4 +683,31 @@ fn login_task(username: String, password: String) -> String {
         Ok("Logged in to Game Jolt.".into())
     })();
     result.unwrap_or_else(|error| format!("Login failed: {error:#}"))
+}
+
+fn is_gamejolt_thumbnail(uri: &str) -> bool {
+    reqwest::Url::parse(uri).is_ok_and(|url| {
+        url.scheme() == "https" && matches!(url.host_str(), Some("m.gjcdn.net" | "i.gjcdn.net"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_gamejolt_thumbnail;
+
+    #[test]
+    fn only_loads_https_gamejolt_cdn_thumbnails() {
+        assert!(is_gamejolt_thumbnail(
+            "https://m.gjcdn.net/game-thumbnail/500/123.webp"
+        ));
+        assert!(is_gamejolt_thumbnail(
+            "https://i.gjcdn.net/public-data/games/1/2/3/thumbnail.png"
+        ));
+        assert!(!is_gamejolt_thumbnail(
+            "http://m.gjcdn.net/game-thumbnail/500/123.webp"
+        ));
+        assert!(!is_gamejolt_thumbnail(
+            "https://m.gjcdn.net.example.test/thumbnail.webp"
+        ));
+    }
 }

@@ -4,6 +4,9 @@
 Downloads games from Game Jolt and runs them from one place. Prefers native
 Linux builds; falls back to Windows builds run through Proton (via
 [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)) or Wine.
+The desktop app opens to a searchable Store, where you can review a game's
+available builds without entering its ID. The Library lists locally installed
+games; Game Jolt account-library sync and social features are not implemented.
 
 ```
 joltux info    <game id | url>        # list available builds, shows which would install
@@ -93,13 +96,14 @@ user-local umu installation.
 Verified here (unit tests + smoke tests with fake games):
 build selection, ID parsing, zip/tar.gz extraction (keeps the exec bit, blocks
 path traversal), executable lookup, library/config files, native launch, and
-the umu-run environment/arguments for Windows launches.
+the umu-run environment/arguments for Windows launches. Public game search was
+also checked against a live Game Jolt response on 2026-11-09.
 
-**NOT verified against the live Game Jolt service.** The sandbox this was
-written in could not reach gamejolt.com. The endpoints and response shapes in
-`src/api.rs` / `src/models.rs` were taken from the official client's source
-(github.com/gamejolt/gamejolt, MIT) and may be wrong or have changed:
+The remaining endpoints and response shapes below were taken from the official
+client's source (github.com/gamejolt/gamejolt, MIT) and are not verified against
+the live service:
 
+- `GET /web/search/games?q=...` (public game search; response shape checked live)
 - `GET  /web/discover/games/:id` (title)
 - `GET  /web/discover/games/packages/:id` (packages, releases, builds, launchOptions)
 - `POST /web/discover/games/builds/get-download-url/:buildId` (JSON body
@@ -115,8 +119,9 @@ that uses it.
 - **CAPTCHA login.** Joltux supports username/password login and device approval,
   but CAPTCHA challenges must be completed in a browser before pasting the
   browser's `frontend` cookie into Joltux.
-- **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
-  You install by game ID/URL.
+- **No account-library sync or social features.** The Library currently lists
+  local installs; Store search is public, but account-owned games, profiles,
+  feeds, friends, achievements, and messaging are not connected.
 - **Build formats:** .zip and .tar.gz archives, plus standalone Windows .exe
   files. Installer builds are not installable.
 - **No updates / no resume** of interrupted downloads.
@@ -127,7 +132,7 @@ that uses it.
 
 ```
 main.rs     CLI (clap) and the install/run/list/uninstall commands
-gui.rs      desktop launcher for the library, installation, account, and settings
+gui.rs      desktop client UI for Store search, local library, installation, account, and settings
 api.rs      Game Jolt site API client
 models.rs   serde types for API responses + the installed-game record
 select.rs   which build to install (native Linux first, then Windows)

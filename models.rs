@@ -21,6 +21,43 @@ fn lenient_bool<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
     })
 }
 
+fn lenient_u64<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let value = Value::deserialize(d)?;
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom("expected a non-negative integer")),
+        Value::String(number) => number.parse().map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "expected an unsigned integer or numeric string",
+        )),
+    }
+}
+
+fn lenient_option_u64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(d)?;
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected a non-negative integer")),
+        Value::String(number) => number.parse().map(Some).map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "expected an unsigned integer, numeric string, or null",
+        )),
+    }
+}
+
+fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let value = Value::deserialize(d)?;
+    match value {
+        Value::String(value) => Ok(value),
+        Value::Null => Ok(String::new()),
+        _ => Err(serde::de::Error::custom("expected a string or null")),
+    }
+}
+
 /// Response of `GET /web/discover/games/packages/:gameId`.
 #[derive(Debug, Default, Deserialize)]
 pub struct PackagePayload {
@@ -37,6 +74,7 @@ pub struct PackagePayload {
 /// A "package" is a named group of releases (e.g. "Demo", "Full game").
 #[derive(Debug, Clone, Deserialize)]
 pub struct Package {
+    #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
     #[serde(default)]
     pub title: Option<String>,
@@ -44,32 +82,34 @@ pub struct Package {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
+    #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub game_package_id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub version_number: String,
     /// The official client sorts releases by this ascending and takes the
     /// first match, so lower = preferred.
     #[serde(default)]
     pub sort: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Build {
+    #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub game_package_id: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub game_release_id: u64,
     /// "downloadable", "html", "flash", "unity", "applet", "rom", ...
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, deserialize_with = "lenient_string")]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub archive_type: String,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub os_windows: bool,
@@ -93,19 +133,19 @@ pub struct Build {
 pub struct BuildFile {
     #[serde(default)]
     pub filename: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_option_u64")]
     pub filesize: Option<u64>,
 }
 
 /// Tells the launcher which file inside the archive to run, per OS.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LaunchOption {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u64")]
     pub game_build_id: u64,
     /// "windows", "windows_64", "linux", "linux_64", "mac", "mac_64" or empty.
     #[serde(default)]
     pub os: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     pub executable_path: String,
 }
 
@@ -131,4 +171,40 @@ pub struct InstalledGame {
     pub version: String,
     pub install_dir: std::path::PathBuf,
     pub executable: std::path::PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PackagePayload;
+
+    #[test]
+    fn parses_numeric_strings_in_package_payload() {
+        let payload: PackagePayload = serde_json::from_str(
+                        r#"{
+                            "packages": [{"id": "258246645", "title": "Game"}],
+                            "releases": [{
+                                "id": "10", "game_package_id": "258246645",
+                                "version_number": null, "status": null
+                            }],
+                            "builds": [{
+                                "id": "100", "game_package_id": "258246645", "game_release_id": "10",
+                                "type": null, "status": null, "archive_type": null,
+                                "primary_file": {"filesize": "4096"}
+                            }],
+                            "launchOptions": [{"game_build_id": "100", "executable_path": null}]
+                        }"#,
+                )
+                .unwrap();
+
+        assert_eq!(payload.packages[0].id, 258246645);
+        assert_eq!(payload.releases[0].game_package_id, 258246645);
+        assert_eq!(payload.builds[0].game_release_id, 10);
+        assert_eq!(
+            payload.builds[0].primary_file.as_ref().unwrap().filesize,
+            Some(4096)
+        );
+        assert_eq!(payload.launch_options[0].game_build_id, 100);
+        assert_eq!(payload.builds[0].kind, "");
+        assert_eq!(payload.launch_options[0].executable_path, "");
+    }
 }

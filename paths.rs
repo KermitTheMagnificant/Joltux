@@ -12,6 +12,7 @@ pub struct Paths {
     pub games_dir: PathBuf,
     pub downloads_dir: PathBuf,
     pub prefixes_dir: PathBuf,
+    pub runtimes_dir: PathBuf,
 }
 
 impl Paths {
@@ -24,6 +25,7 @@ impl Paths {
             games_dir: data.join("games"),
             downloads_dir: data.join("downloads"),
             prefixes_dir: data.join("prefixes"),
+            runtimes_dir: data.join("runtimes"),
         })
     }
 

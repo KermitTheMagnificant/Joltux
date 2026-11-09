@@ -20,6 +20,10 @@ pub enum Runner {
 #[serde(default)]
 pub struct Config {
     pub runner: Runner,
+    /// Path to a Joltux-managed or system umu-run executable.
+    pub umu_path: String,
+    /// Path to Wine, or a command name resolved through PATH.
+    pub wine_path: String,
     /// Passed to umu as PROTONPATH: a Proton folder path, or a name such as
     /// "GE-Proton" (umu downloads the latest GE-Proton for you).
     pub proton_path: String,
@@ -32,6 +36,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             runner: Runner::Umu,
+            umu_path: "umu-run".to_string(),
+            wine_path: "wine".to_string(),
             proton_path: "GE-Proton".to_string(),
             session_cookie: None,
         }
@@ -71,11 +77,13 @@ impl Config {
                     other => bail!("runner must be `umu` or `wine`, not `{other}`"),
                 }
             }
+            "umu_path" => self.umu_path = value.to_string(),
+            "wine_path" => self.wine_path = value.to_string(),
             "proton_path" => self.proton_path = value.to_string(),
             "session_cookie" => {
                 self.session_cookie = if value.is_empty() { None } else { Some(value.to_string()) }
             }
-            other => bail!("unknown setting `{other}` (try: runner, proton_path, session_cookie)"),
+            other => bail!("unknown setting `{other}` (try: runner, umu_path, wine_path, proton_path, session_cookie)"),
         }
         Ok(())
     }
@@ -84,8 +92,25 @@ impl Config {
     pub fn redacted(&self) -> String {
         let cookie = if self.session_cookie.is_some() { "(set)" } else { "(not set)" };
         format!(
-            "runner         = {:?}\nproton_path    = {}\nsession_cookie = {}",
-            self.runner, self.proton_path, cookie
+            "runner         = {:?}\numu_path       = {}\nwine_path      = {}\nproton_path    = {}\nsession_cookie = {}",
+            self.runner, self.umu_path, self.wine_path, self.proton_path, cookie
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Config, Runner};
+
+    #[test]
+    fn loads_configs_without_runtime_paths() {
+        let config: Config = serde_json::from_str(
+            r#"{"runner":"wine","proton_path":"GE-Proton"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.runner, Runner::Wine);
+        assert_eq!(config.umu_path, "umu-run");
+        assert_eq!(config.wine_path, "wine");
     }
 }

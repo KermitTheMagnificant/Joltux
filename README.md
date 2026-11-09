@@ -14,8 +14,11 @@ joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine pre
 joltux login                          # sign in to Game Jolt
 joltux logout                         # remove the saved login
 joltux update                         # install the latest version from GitHub
+joltux setup                          # install Wine + umu-launcher and configure Proton
 joltux config show
 joltux config set runner umu|wine
+joltux config set umu_path /path/to/umu-run
+joltux config set wine_path /path/to/wine
 joltux config set proton_path GE-Proton        # or a path to a Proton folder
 ```
 
@@ -72,6 +75,14 @@ Native Linux games need no additional runner. Windows games use `umu-run` by
 default, so install umu-launcher and make sure `umu-run` is on your `PATH`.
 Alternatively, install Wine and select it with `joltux config set runner wine`.
 
+Run `joltux setup` to install the latest official umu-launcher into Joltux's
+user data directory, install Wine from a supported system package manager, and
+configure `GE-Proton` as the UMU runner. UMU downloads GE-Proton the first time
+you launch a Windows game. Setup supports Debian/Ubuntu (`apt`), Fedora/RHEL
+(`dnf`), Arch (`pacman`), and openSUSE (`zypper`); Wine installation may ask for
+administrator authentication. Python 3 with `venv` support is required for the
+user-local umu installation.
+
 ## Status: what is and isn't verified
 
 Verified here (unit tests + smoke tests with fake games):
@@ -117,6 +128,7 @@ models.rs   serde types for API responses + the installed-game record
 select.rs   which build to install (native Linux first, then Windows)
 install.rs  download, extract, locate the executable
 launch.rs   run natively or through umu-run / wine
+runtime.rs  install umu-launcher and system Wine; configure GE-Proton
 config.rs   settings (runner, proton path, session cookie)
 library.rs  installed-games list
 paths.rs    XDG locations (~/.config/joltux, ~/.local/share/joltux)

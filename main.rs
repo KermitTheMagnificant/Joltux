@@ -10,6 +10,7 @@ mod launch;
 mod library;
 mod models;
 mod paths;
+mod runtime;
 mod select;
 
 use std::fs;
@@ -61,6 +62,8 @@ enum Command {
     Logout,
     /// Update Joltux from its GitHub repository
     Update,
+    /// Install Wine and umu-launcher, then configure Proton
+    Setup,
     /// Remove an installed game (and, with --prefix, its Wine prefix)
     Uninstall {
         game_id: u64,
@@ -79,7 +82,7 @@ enum Command {
 enum ConfigAction {
     /// Print current settings
     Show,
-    /// Set a value: runner (umu|wine), proton_path, session_cookie
+    /// Set a value: runner (umu|wine), umu_path, wine_path, proton_path, session_cookie
     Set { key: String, value: String },
 }
 
@@ -103,6 +106,7 @@ fn run() -> Result<()> {
         Command::Login => cmd_login(&paths),
         Command::Logout => cmd_logout(&paths),
         Command::Update => cmd_update(),
+        Command::Setup => cmd_setup(&paths),
         Command::Uninstall { game_id, prefix } => cmd_uninstall(&paths, game_id, prefix),
         Command::Config { action } => cmd_config(&paths, action),
     }
@@ -137,7 +141,7 @@ fn cmd_info(paths: &Paths, game: &str) -> Result<()> {
 
     let candidates = select::candidates(&payload, false);
     if candidates.is_empty() {
-        println!("  no installable Linux or Windows archive builds found (web-only, macOS-only, paid/unowned, or raw files)");
+        println!("  no installable Linux or Windows builds found (web-only, macOS-only, paid/unowned, installers, or unsupported raw files)");
         return Ok(());
     }
     for (i, c) in candidates.iter().enumerate() {
@@ -315,6 +319,13 @@ fn cmd_update() -> Result<()> {
         bail!("Joltux update failed (Cargo exited with {status})");
     }
     println!("Joltux is up to date.");
+    Ok(())
+}
+
+fn cmd_setup(paths: &Paths) -> Result<()> {
+    let mut config = Config::load(paths)?;
+    runtime::setup(paths, &mut config)?;
+    println!("Runtime setup complete. Windows games will use umu with GE-Proton.");
     Ok(())
 }
 

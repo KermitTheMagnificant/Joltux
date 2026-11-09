@@ -41,6 +41,7 @@ pub fn run() -> Result<()> {
 struct JoltuxApp {
     paths: Paths,
     page: Page,
+    page_history: Vec<Page>,
     games: Vec<InstalledGame>,
     config: Config,
     receiver: Receiver<String>,
@@ -85,6 +86,7 @@ impl JoltuxApp {
         Ok(Self {
             paths,
             page: Page::Store,
+            page_history: Vec::new(),
             games,
             config,
             receiver,
@@ -108,6 +110,19 @@ impl JoltuxApp {
             cookie_input: String::new(),
             show_cookie: false,
         })
+    }
+
+    fn navigate_to(&mut self, page: Page) {
+        if self.page != page {
+            self.page_history.push(self.page);
+            self.page = page;
+        }
+    }
+
+    fn go_back(&mut self) {
+        if let Some(page) = self.page_history.pop() {
+            self.page = page;
+        }
     }
 
     fn start_task(&mut self, task: impl FnOnce() -> String + Send + 'static) {
@@ -340,7 +355,7 @@ impl JoltuxApp {
         if let Some((game_id, title)) = review_game {
             self.game_input = game_id.to_string();
             self.windows_only = false;
-            self.page = Page::Install;
+            self.navigate_to(Page::Install);
             self.status = format!("Reviewing builds for {title}...");
             self.run_cli(vec!["info".into(), game_id.to_string()]);
         }
@@ -364,7 +379,7 @@ impl JoltuxApp {
         if self.games.is_empty() {
             ui.label("No games installed yet.");
             if ui.button("Install a game").clicked() {
-                self.page = Page::Install;
+                self.navigate_to(Page::Install);
             }
             return;
         }
@@ -635,10 +650,29 @@ impl eframe::App for JoltuxApp {
                     (Page::Settings, "Settings"),
                 ] {
                     if ui.selectable_label(self.page == page, label).clicked() {
-                        self.page = page;
+                        self.navigate_to(page);
                     }
                 }
             });
+
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!self.page_history.is_empty(), egui::Button::new("Back"))
+                    .clicked()
+                {
+                    self.go_back();
+                }
+                ui.separator();
+                ui.heading(match self.page {
+                    Page::Store => "Store",
+                    Page::Library => "Library",
+                    Page::Install => "Add a game",
+                    Page::Account => "Account",
+                    Page::Settings => "Settings",
+                });
+            });
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
             Page::Store => self.store_page(ui),

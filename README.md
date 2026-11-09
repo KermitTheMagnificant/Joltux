@@ -38,9 +38,9 @@ Open a terminal in the Joltux project directory and run:
 ./install.sh
 ```
 
-The script builds Joltux and installs the `joltux` command in Cargo's bin
-directory (usually `~/.cargo/bin`). It does not need `sudo`. Check the
-installation with:
+The script builds Joltux, installs the `joltux` command in Cargo's bin
+directory (usually `~/.cargo/bin`), and adds a Joltux shortcut to your desktop
+application menu. It does not need `sudo`. Check the installation with:
 
 ```
 joltux --help
@@ -48,8 +48,11 @@ joltux --help
 
 If the shell says `joltux` was not found, add `~/.cargo/bin` to your `PATH`
 and open a new terminal. To install directly without the script, run
-`cargo install --path . --locked` from the project directory. To uninstall,
-run `cargo uninstall joltux`. Run `cargo test` to execute the tests.
+`cargo install --path . --locked` from the project directory; this does not add
+the application-menu shortcut. To uninstall, run `cargo uninstall joltux` and
+remove `joltux.desktop` from `$XDG_DATA_HOME/applications` (or
+`~/.local/share/applications` when `XDG_DATA_HOME` is unset). Run `cargo test`
+to execute the tests.
 
 ## Run a game
 

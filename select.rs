@@ -2,7 +2,7 @@
 //!
 //! Policy: prefer a native Linux build (fast, no compatibility layer). Fall
 //! back to a Windows build that will run through Proton/Wine. Browser builds,
-//! installers, removed builds and macOS-only builds are never chosen.
+//! raw files, installers, removed builds and macOS-only builds are never chosen.
 
 use serde::{Deserialize, Serialize};
 
@@ -50,10 +50,19 @@ pub fn candidates(payload: &PackagePayload, windows_only: bool) -> Vec<Choice<'_
         .builds
         .iter()
         .filter(|b| b.is_downloadable() && b.is_active() && !b.is_installer)
+        .filter(|b| b.primary_file.as_ref().and_then(|file| file.is_archive) != Some(false))
         .filter_map(|build| {
             let (platform, rank) = classify(build, windows_only)?;
-            let release = payload.releases.iter().find(|r| r.id == build.game_release_id);
-            Some(Choice { build, release, platform, rank })
+            let release = payload
+                .releases
+                .iter()
+                .find(|r| r.id == build.game_release_id);
+            Some(Choice {
+                build,
+                release,
+                platform,
+                rank,
+            })
         })
         .collect();
 
@@ -105,7 +114,10 @@ mod tests {
                 {"id": 102, "game_package_id": 1, "game_release_id": 10, "type": "html",
                  "status": "active"},
                 {"id": 103, "game_package_id": 1, "game_release_id": 10, "type": "downloadable",
-                 "status": "removed", "os_linux_64": true}
+                 "status": "removed", "os_linux_64": true},
+                {"id": 104, "game_package_id": 1, "game_release_id": 10, "type": "downloadable",
+                 "status": "active", "os_windows_64": true,
+                 "primary_file": {"filename": "game.exe", "is_archive": false}}
               ],
               "launchOptions": [
                 {"game_build_id": 100, "os": "windows_64", "executable_path": "Game.exe"},

@@ -135,6 +135,8 @@ pub struct BuildFile {
     pub filename: Option<String>,
     #[serde(default, deserialize_with = "lenient_option_u64")]
     pub filesize: Option<u64>,
+    #[serde(default)]
+    pub is_archive: Option<bool>,
 }
 
 /// Tells the launcher which file inside the archive to run, per OS.
@@ -189,7 +191,7 @@ mod tests {
                             "builds": [{
                                 "id": "100", "game_package_id": "258246645", "game_release_id": "10",
                                 "type": null, "status": null, "archive_type": null,
-                                "primary_file": {"filesize": "4096"}
+                                "primary_file": {"filesize": "4096", "is_archive": true}
                             }],
                             "launchOptions": [{"game_build_id": "100", "executable_path": null}]
                         }"#,

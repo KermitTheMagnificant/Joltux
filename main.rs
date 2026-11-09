@@ -137,7 +137,7 @@ fn cmd_info(paths: &Paths, game: &str) -> Result<()> {
 
     let candidates = select::candidates(&payload, false);
     if candidates.is_empty() {
-        println!("  no installable Linux or Windows builds found (web-only, macOS-only, or paid/unowned)");
+        println!("  no installable Linux or Windows archive builds found (web-only, macOS-only, paid/unowned, or raw files)");
         return Ok(());
     }
     for (i, c) in candidates.iter().enumerate() {
@@ -163,7 +163,7 @@ fn cmd_install(paths: &Paths, game: &str, windows_only: bool) -> Result<()> {
     let title = api.game_title(id)?.unwrap_or_else(|| format!("game {id}"));
     let payload = api.packages(id)?;
     let Some(choice) = select::choose(&payload, windows_only) else {
-        bail!("{title} has no installable Linux or Windows build");
+        bail!("{title} has no installable Linux or Windows archive build (Joltux supports .zip and .tar.gz archives, not raw executables or installers)");
     };
     let version = choice.release.map(|r| r.version_number.clone()).unwrap_or_default();
     println!("Installing {title}: build {} ({})", choice.build.id, describe(choice.platform));

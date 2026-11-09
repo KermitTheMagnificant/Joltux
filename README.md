@@ -101,8 +101,8 @@ that uses it.
   browser's `frontend` cookie into Joltux.
 - **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
   You install by game ID/URL.
-- **Archive formats:** only .zip and .tar.gz. 7z and others are rejected with
-  a clear error.
+- **Build formats:** only .zip and .tar.gz archives are supported. Raw files
+  (including standalone executables) and installer builds are not installable.
 - **No updates / no resume** of interrupted downloads.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
 - **Symlinks inside zips** are written as plain files.

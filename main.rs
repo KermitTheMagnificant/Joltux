@@ -5,6 +5,7 @@
 
 mod api;
 mod config;
+mod gui;
 mod install;
 mod launch;
 mod library;
@@ -64,6 +65,8 @@ enum Command {
     Update,
     /// Install Wine and umu-launcher, then configure Proton
     Setup,
+    /// Open the desktop launcher
+    Gui,
     /// Remove an installed game (and, with --prefix, its Wine prefix)
     Uninstall {
         game_id: u64,
@@ -107,6 +110,7 @@ fn run() -> Result<()> {
         Command::Logout => cmd_logout(&paths),
         Command::Update => cmd_update(),
         Command::Setup => cmd_setup(&paths),
+        Command::Gui => gui::run(),
         Command::Uninstall { game_id, prefix } => cmd_uninstall(&paths, game_id, prefix),
         Command::Config { action } => cmd_config(&paths, action),
     }

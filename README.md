@@ -15,6 +15,7 @@ joltux login                          # sign in to Game Jolt
 joltux logout                         # remove the saved login
 joltux update                         # install the latest version from GitHub
 joltux setup                          # install Wine + umu-launcher and configure Proton
+joltux gui                            # open the desktop launcher
 joltux config show
 joltux config set runner umu|wine
 joltux config set umu_path /path/to/umu-run
@@ -59,6 +60,7 @@ joltux info 123456
 joltux install 123456
 joltux list
 joltux run 123456
+joltux gui
 ```
 
 Use `joltux login` to sign in. The password is entered without being echoed
@@ -117,12 +119,12 @@ that uses it.
 - **No updates / no resume** of interrupted downloads.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
 - **Symlinks inside zips** are written as plain files.
-- No GUI. It is CLI-only; the modules are split so a GUI can sit on top.
 
 ## Layout
 
 ```
 main.rs     CLI (clap) and the install/run/list/uninstall commands
+gui.rs      desktop launcher for the library, installation, account, and settings
 api.rs      Game Jolt site API client
 models.rs   serde types for API responses + the installed-game record
 select.rs   which build to install (native Linux first, then Windows)

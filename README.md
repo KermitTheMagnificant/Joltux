@@ -1,0 +1,113 @@
+# Joltux: unofficial Game Jolt launcher for Linux
+# AI WARNING: 
+## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass!)
+Downloads games from Game Jolt and runs them from one place. Prefers native
+Linux builds; falls back to Windows builds run through Proton (via
+[umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)) or Wine.
+
+```
+joltux info    <game id | url>        # list available builds, shows which would install
+joltux install <game id | url>        # download + extract (add --windows to skip native Linux builds)
+joltux list                           # installed games
+joltux run     <game id>              # launch (native, or through Proton/Wine)
+joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
+joltux config show
+joltux config set runner umu|wine
+joltux config set proton_path GE-Proton        # or a path to a Proton folder
+joltux config set session_cookie <value>       # only needed for account-only games
+```
+
+A game's ID is the number at the end of its URL:
+`https://gamejolt.com/games/some-game/123456` -> `123456`.
+
+## Install on Linux
+
+You need a stable Rust toolchain and Cargo. If they are not installed,
+[install Rust with rustup](https://rustup.rs/). The first build needs internet
+access to download the Rust dependencies.
+
+Open a terminal in the Joltux project directory and run:
+
+```
+./install.sh
+```
+
+The script builds Joltux and installs the `joltux` command in Cargo's bin
+directory (usually `~/.cargo/bin`). It does not need `sudo`. Check the
+installation with:
+
+```
+joltux --help
+```
+
+If the shell says `joltux` was not found, add `~/.cargo/bin` to your `PATH`
+and open a new terminal. To install directly without the script, run
+`cargo install --path . --locked` from the project directory. To uninstall,
+run `cargo uninstall joltux`. Run `cargo test` to execute the tests.
+
+## Run a game
+
+Use the numeric ID at the end of a Game Jolt game URL, or pass the full URL:
+
+```
+joltux info 123456
+joltux install 123456
+joltux list
+joltux run 123456
+```
+
+Native Linux games need no additional runner. Windows games use `umu-run` by
+default, so install umu-launcher and make sure `umu-run` is on your `PATH`.
+Alternatively, install Wine and select it with `joltux config set runner wine`.
+
+## Status: what is and isn't verified
+
+Verified here (unit tests + smoke tests with fake games):
+build selection, ID parsing, zip/tar.gz extraction (keeps the exec bit, blocks
+path traversal), executable lookup, library/config files, native launch, and
+the umu-run environment/arguments for Windows launches.
+
+**NOT verified against the live Game Jolt service.** The sandbox this was
+written in could not reach gamejolt.com. The endpoints and response shapes in
+`src/api.rs` / `src/models.rs` were taken from the official client's source
+(github.com/gamejolt/gamejolt, MIT) and may be wrong or have changed:
+
+- `GET  /web/discover/games/:id` (title)
+- `GET  /web/discover/games/packages/:id` (packages, releases, builds, launchOptions)
+- `POST /web/discover/games/builds/get-download-url/:buildId` (JSON body
+  `{"forceDownload": true}` is a guess; the official client's exact encoding
+  wasn't checked)
+
+This is an undocumented site API, not a public one. It can change without
+notice, and you should check Game Jolt's terms before distributing a client
+that uses it.
+
+## Known gaps
+
+- **Login.** The site's login uses captchas and login-approval flows, so Joltux
+  doesn't do username/password login. Public free games work anonymously; for
+  anything account-linked, copy the `frontend` cookie from a logged-in browser
+  session into `joltux config set session_cookie ...`. A proper OAuth-style login
+  is future work.
+- **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
+  You install by game ID/URL.
+- **Archive formats:** only .zip and .tar.gz. 7z and others are rejected with
+  a clear error.
+- **No updates / no resume** of interrupted downloads.
+- **No installer (.msi/setup.exe) builds**, same as the official client.
+- **Symlinks inside zips** are written as plain files.
+- No GUI. It is CLI-only; the modules are split so a GUI can sit on top.
+
+## Layout
+
+```
+main.rs     CLI (clap) and the install/run/list/uninstall commands
+api.rs      Game Jolt site API client
+models.rs   serde types for API responses + the installed-game record
+select.rs   which build to install (native Linux first, then Windows)
+install.rs  download, extract, locate the executable
+launch.rs   run natively or through umu-run / wine
+config.rs   settings (runner, proton path, session cookie)
+library.rs  installed-games list
+paths.rs    XDG locations (~/.config/joltux, ~/.local/share/joltux)
+```

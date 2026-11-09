@@ -13,11 +13,13 @@ mod paths;
 mod select;
 
 use std::fs;
+use std::io::{self, Write};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, LoginOutcome};
 use crate::config::Config;
 use crate::library::Library;
 use crate::models::InstalledGame;
@@ -53,6 +55,12 @@ enum Command {
     },
     /// List installed games
     List,
+    /// Log in to Game Jolt
+    Login,
+    /// Log out of Game Jolt
+    Logout,
+    /// Update Joltux from its GitHub repository
+    Update,
     /// Remove an installed game (and, with --prefix, its Wine prefix)
     Uninstall {
         game_id: u64,
@@ -92,6 +100,9 @@ fn run() -> Result<()> {
         Command::Install { game, windows } => cmd_install(&paths, &game, windows),
         Command::Run { game_id } => cmd_run(&paths, game_id),
         Command::List => cmd_list(&paths),
+        Command::Login => cmd_login(&paths),
+        Command::Logout => cmd_logout(&paths),
+        Command::Update => cmd_update(),
         Command::Uninstall { game_id, prefix } => cmd_uninstall(&paths, game_id, prefix),
         Command::Config { action } => cmd_config(&paths, action),
     }
@@ -211,6 +222,71 @@ fn cmd_list(paths: &Paths) -> Result<()> {
     for g in &library.games {
         println!("{:>8}  {}  [{}]", g.game_id, g.title, describe(g.platform));
     }
+    Ok(())
+}
+
+fn cmd_login(paths: &Paths) -> Result<()> {
+    let mut username = String::new();
+    print!("Game Jolt username: ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut username)?;
+    let username = username.trim();
+    if username.is_empty() {
+        bail!("username cannot be empty");
+    }
+    let password = rpassword::prompt_password("Password: ").context("could not read password")?;
+    let api = ApiClient::new(None)?;
+
+    let cookie = match api.login(username, &password)? {
+        LoginOutcome::Authenticated(cookie) => cookie,
+        LoginOutcome::CaptchaRequired => {
+            println!("Game Jolt requires a CAPTCHA. Sign in through your browser, then copy its frontend session cookie here.");
+            let cookie = rpassword::prompt_password("frontend cookie: ")
+                .context("could not read frontend cookie")?;
+            if cookie.is_empty() {
+                bail!("frontend cookie cannot be empty");
+            }
+            cookie
+        }
+        LoginOutcome::ApprovalRequired(token) => {
+            println!("Approve this login using the link Game Jolt emailed you. Waiting up to 10 minutes...");
+            api.poll_login_approval(&token)?
+        }
+    };
+
+    let mut config = Config::load(paths)?;
+    config.session_cookie = Some(cookie);
+    config.save(paths)?;
+    println!("Logged in to Game Jolt.");
+    Ok(())
+}
+
+fn cmd_logout(paths: &Paths) -> Result<()> {
+    let mut config = Config::load(paths)?;
+    config.session_cookie = None;
+    config.save(paths)?;
+    println!("Logged out of Game Jolt.");
+    Ok(())
+}
+
+fn cmd_update() -> Result<()> {
+    println!("Updating Joltux from GitHub...");
+    let status = ProcessCommand::new("cargo")
+        .args([
+            "install",
+            "--git",
+            "https://github.com/KermitTheMagnificant/Joltux.git",
+            "--locked",
+            "--force",
+            "--bin",
+            "joltux",
+        ])
+        .status()
+        .context("could not start Cargo; install Rust and Cargo to update Joltux")?;
+    if !status.success() {
+        bail!("Joltux update failed (Cargo exited with {status})");
+    }
+    println!("Joltux is up to date.");
     Ok(())
 }
 

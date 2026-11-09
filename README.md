@@ -11,10 +11,12 @@ joltux install <game id | url>        # download + extract (add --windows to ski
 joltux list                           # installed games
 joltux run     <game id>              # launch (native, or through Proton/Wine)
 joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
+joltux login                          # sign in to Game Jolt
+joltux logout                         # remove the saved login
+joltux update                         # install the latest version from GitHub
 joltux config show
 joltux config set runner umu|wine
 joltux config set proton_path GE-Proton        # or a path to a Proton folder
-joltux config set session_cookie <value>       # only needed for account-only games
 ```
 
 A game's ID is the number at the end of its URL:
@@ -56,6 +58,16 @@ joltux list
 joltux run 123456
 ```
 
+Use `joltux login` to sign in. The password is entered without being echoed
+and is not saved; Joltux stores only the Game Jolt session cookie in its
+owner-only config file. If Game Jolt requires a CAPTCHA, sign in through your
+browser and paste its `frontend` session cookie when prompted. Use
+`joltux logout` to clear the saved session.
+
+Run `joltux update` to rebuild and replace the installed Joltux binary from the
+GitHub repository's default branch. This requires Cargo and internet access;
+it does not update a local source checkout.
+
 Native Linux games need no additional runner. Windows games use `umu-run` by
 default, so install umu-launcher and make sure `umu-run` is on your `PATH`.
 Alternatively, install Wine and select it with `joltux config set runner wine`.
@@ -84,11 +96,9 @@ that uses it.
 
 ## Known gaps
 
-- **Login.** The site's login uses captchas and login-approval flows, so Joltux
-  doesn't do username/password login. Public free games work anonymously; for
-  anything account-linked, copy the `frontend` cookie from a logged-in browser
-  session into `joltux config set session_cookie ...`. A proper OAuth-style login
-  is future work.
+- **CAPTCHA login.** Joltux supports username/password login and device approval,
+  but CAPTCHA challenges must be completed in a browser before pasting the
+  browser's `frontend` cookie into Joltux.
 - **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
   You install by game ID/URL.
 - **Archive formats:** only .zip and .tar.gz. 7z and others are rejected with

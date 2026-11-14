@@ -472,7 +472,13 @@ impl eframe::App for JoltuxApp {
             .exact_width(176.0)
             .show(ctx, |ui| {
                 ui.add_space(8.0);
-                ui.heading("Joltux");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Image::new(egui::include_image!("assets/joltux-icon-256.png"))
+                            .fit_to_exact_size(egui::vec2(32.0, 32.0)),
+                    );
+                    ui.heading(egui::RichText::new("Joltux").strong());
+                });
                 ui.add_space(20.0);
                 for (page, label) in [
                     (Page::Store, "Store"),

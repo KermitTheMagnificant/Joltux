@@ -62,7 +62,11 @@ enum Command {
     /// Log out of Game Jolt
     Logout,
     /// Update Joltux from its GitHub repository
-    Update,
+    Update {
+        /// Rebuild even if the installed commit already matches GitHub
+        #[arg(long)]
+        force: bool,
+    },
     /// Install Wine and umu-launcher, then configure Proton
     Setup,
     /// Open the desktop launcher
@@ -108,7 +112,7 @@ fn run() -> Result<()> {
         Command::List => cmd_list(&paths),
         Command::Login => cmd_login(&paths),
         Command::Logout => cmd_logout(&paths),
-        Command::Update => cmd_update(),
+        Command::Update { force } => cmd_update(force),
         Command::Setup => cmd_setup(&paths),
         Command::Gui => gui::run(),
         Command::Uninstall { game_id, prefix } => cmd_uninstall(&paths, game_id, prefix),
@@ -305,25 +309,95 @@ fn cmd_logout(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn cmd_update() -> Result<()> {
+const REPO_URL: &str = "https://github.com/KermitTheMagnificant/Joltux.git";
+const LATEST_COMMIT_API: &str =
+    "https://api.github.com/repos/KermitTheMagnificant/Joltux/commits/main";
+
+fn cmd_update(force: bool) -> Result<()> {
+    if !force {
+        match (installed_commit(), latest_commit()) {
+            (Some(installed), Ok(latest)) if installed == latest => {
+                println!("Joltux is already up to date (commit {}).", short_sha(&latest));
+                return Ok(());
+            }
+            (Some(installed), Ok(latest)) => {
+                println!(
+                    "Update available: {} -> {}.",
+                    short_sha(&installed),
+                    short_sha(&latest)
+                );
+            }
+            (None, Ok(latest)) => {
+                println!(
+                    "Can't tell which commit is installed (it was probably installed from a local copy). \
+                     Installing the latest commit, {}.",
+                    short_sha(&latest)
+                );
+            }
+            (_, Err(err)) => {
+                println!("Couldn't check GitHub for the latest version ({err:#}). Updating anyway.");
+            }
+        }
+    }
+
     println!("Updating Joltux from GitHub...");
     let status = ProcessCommand::new("cargo")
-        .args([
-            "install",
-            "--git",
-            "https://github.com/KermitTheMagnificant/Joltux.git",
-            "--locked",
-            "--force",
-            "--bin",
-            "joltux",
-        ])
+        .args(["install", "--git", REPO_URL, "--locked", "--force", "--bin", "joltux"])
         .status()
         .context("could not start Cargo; install Rust and Cargo to update Joltux")?;
     if !status.success() {
         bail!("Joltux update failed (Cargo exited with {status})");
     }
-    println!("Joltux is up to date.");
+    println!("Joltux updated.");
     Ok(())
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// The commit `cargo install --git` recorded for Joltux, if it was installed that way.
+fn installed_commit() -> Option<String> {
+    let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
+        .or_else(|| std::env::var_os("CARGO_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")))?;
+    let text = fs::read_to_string(cargo_root.join(".crates2.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    commit_from_crates2(&json)
+}
+
+/// Finds the Joltux entry, keyed like `joltux 0.1.0 (git+https://...Joltux.git#<sha>)`.
+fn commit_from_crates2(json: &serde_json::Value) -> Option<String> {
+    let repo = REPO_URL.trim_end_matches(".git").to_ascii_lowercase();
+    json.get("installs")?.as_object()?.keys().find_map(|key| {
+        let source = key.strip_prefix("joltux ")?.split_once(" (git+")?.1.strip_suffix(')')?;
+        let (url, sha) = source.rsplit_once('#')?;
+        let url = url.split('?').next()?.trim_end_matches(".git").to_ascii_lowercase();
+        (url == repo).then(|| sha.to_owned())
+    })
+}
+
+/// The latest commit on `main` according to the GitHub API.
+fn latest_commit() -> Result<String> {
+    let resp = reqwest::blocking::Client::builder()
+        .user_agent(api::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("failed to build HTTP client")?
+        .get(LATEST_COMMIT_API)
+        .header("Accept", "application/vnd.github.sha")
+        .send()
+        .context("could not reach GitHub")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("GitHub returned HTTP {status}");
+    }
+    let sha = resp.text().context("could not read GitHub's response")?.trim().to_owned();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("GitHub returned an unexpected response");
+    }
+    Ok(sha)
 }
 
 fn cmd_setup(paths: &Paths) -> Result<()> {
@@ -367,7 +441,7 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_game_id;
+    use super::{commit_from_crates2, parse_game_id};
 
     #[test]
     fn parses_ids_and_urls() {
@@ -376,5 +450,19 @@ mod tests {
         assert_eq!(parse_game_id("https://gamejolt.com/games/cool-game/12345/").unwrap(), 12345);
         assert_eq!(parse_game_id("https://gamejolt.com/games/cool-game/12345?ref=x#top").unwrap(), 12345);
         assert!(parse_game_id("https://gamejolt.com/games/cool-game").is_err());
+    }
+
+    #[test]
+    fn finds_installed_commit_in_crates2() {
+        let json = serde_json::json!({"installs": {
+            "rls 0.1.0 (git+https://github.com/KermitTheMagnificant/GRNU.git#aaaa)": {},
+            "joltux 0.1.0 (git+https://github.com/KermitTheMagnificant/Joltux.git#bbbb)": {}
+        }});
+        assert_eq!(commit_from_crates2(&json).as_deref(), Some("bbbb"));
+
+        let path_install = serde_json::json!({"installs": {
+            "joltux 0.1.0 (path+file:///home/me/Joltux)": {}
+        }});
+        assert_eq!(commit_from_crates2(&path_install), None);
     }
 }

@@ -1,4 +1,6 @@
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use anyhow::{Context, Result};
@@ -7,20 +9,26 @@ use eframe::egui;
 use crate::api::{ApiClient, LoginOutcome};
 use crate::config::{Config, Runner};
 use crate::library::Library;
-use crate::models::{GameSearchPayload, GameSearchResult, InstalledGame};
+use crate::models::InstalledGame;
 use crate::paths::Paths;
+use crate::store::{Store, StoreAction};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Store,
+    Game,
     Library,
     Install,
     Account,
     Settings,
 }
 
-enum StoreMessage {
-    Search(Result<GameSearchPayload, String>),
+/// Messages from a background task to the GUI.
+enum TaskMessage {
+    /// Everything the task has printed so far.
+    Output(String),
+    /// The task finished; this becomes the status line.
+    Done(String),
 }
 
 pub fn run() -> Result<()> {
@@ -44,19 +52,13 @@ struct JoltuxApp {
     page_history: Vec<Page>,
     games: Vec<InstalledGame>,
     config: Config,
-    receiver: Receiver<String>,
-    sender: Sender<String>,
-    store_receiver: Receiver<StoreMessage>,
-    store_sender: Sender<StoreMessage>,
+    receiver: Receiver<TaskMessage>,
+    sender: Sender<TaskMessage>,
+    /// Live output of the running command, shown under the status.
+    task_output: String,
     busy: bool,
     status: String,
-    store_query: String,
-    store_games: Vec<GameSearchResult>,
-    store_page: u32,
-    store_per_page: u32,
-    store_game_count: u64,
-    store_searching: bool,
-    store_error: Option<String>,
+    store: Store,
     game_input: String,
     windows_only: bool,
     remove_prefix: bool,
@@ -70,7 +72,6 @@ impl JoltuxApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
         let paths = Paths::discover()?;
         let (sender, receiver) = mpsc::channel();
-        let (store_sender, store_receiver) = mpsc::channel();
         egui_extras::install_image_loaders(&cc.egui_ctx);
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::light();
@@ -91,17 +92,10 @@ impl JoltuxApp {
             config,
             receiver,
             sender,
-            store_receiver,
-            store_sender,
+            task_output: String::new(),
             busy: false,
             status: String::new(),
-            store_query: String::new(),
-            store_games: Vec::new(),
-            store_page: 1,
-            store_per_page: 36,
-            store_game_count: 0,
-            store_searching: false,
-            store_error: None,
+            store: Store::new(),
             game_input: String::new(),
             windows_only: false,
             remove_prefix: false,
@@ -125,84 +119,34 @@ impl JoltuxApp {
         }
     }
 
-    fn start_task(&mut self, task: impl FnOnce() -> String + Send + 'static) {
+    fn start_task(&mut self, task: impl FnOnce(&Sender<TaskMessage>) -> String + Send + 'static) {
         if self.busy {
             return;
         }
         self.busy = true;
         self.status = "Working...".to_owned();
+        self.task_output.clear();
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(task());
+            let result = task(&sender);
+            let _ = sender.send(TaskMessage::Done(result));
         });
     }
 
     fn run_cli(&mut self, args: Vec<String>) {
-        self.start_task(move || {
-            let result = std::env::current_exe()
-                .context("could not find the Joltux executable")
-                .and_then(|exe| {
-                    Command::new(exe)
-                        .args(args)
-                        .stdin(Stdio::inherit())
-                        .output()
-                        .context("could not start Joltux command")
-                });
-            match result {
-                Ok(output) => {
-                    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    if !stderr.trim().is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str(stderr.trim());
-                    }
-                    if output.status.success() {
-                        if text.trim().is_empty() {
-                            "Done.".to_owned()
-                        } else {
-                            text
-                        }
-                    } else if text.trim().is_empty() {
-                        format!("Command failed with {}.", output.status)
-                    } else {
-                        format!("Command failed: {text}")
-                    }
-                }
-                Err(error) => format!("Error: {error:#}"),
-            }
+        self.start_task(move |sender| match run_streaming(args, sender) {
+            Ok((true, text)) if text.trim().is_empty() => "Done.".to_owned(),
+            Ok((true, text)) => text,
+            Ok((false, text)) if text.trim().is_empty() => "Command failed.".to_owned(),
+            Ok((false, text)) => format!("Command failed: {text}"),
+            Err(error) => format!("Error: {error:#}"),
         });
     }
 
     fn login(&mut self) {
         let username = self.login_username.trim().to_owned();
         let password = std::mem::take(&mut self.login_password);
-        self.start_task(move || login_task(username, password));
-    }
-
-    fn search_store(&mut self, page: u32) {
-        let query = self.store_query.trim().to_owned();
-        if query.is_empty() || self.store_searching {
-            return;
-        }
-
-        self.store_searching = true;
-        self.store_error = None;
-        self.store_page = page.max(1);
-        if self.store_page == 1 {
-            self.store_games.clear();
-            self.store_game_count = 0;
-        }
-        let page = self.store_page;
-        let session_cookie = self.config.session_cookie.clone();
-        let sender = self.store_sender.clone();
-        std::thread::spawn(move || {
-            let result = ApiClient::new(session_cookie.as_deref())
-                .and_then(|api| api.search_games(&query, page))
-                .map_err(|error| format!("{error:#}"));
-            let _ = sender.send(StoreMessage::Search(result));
-        });
+        self.start_task(move |_| login_task(username, password));
     }
 
     fn refresh(&mut self) {
@@ -217,147 +161,29 @@ impl JoltuxApp {
     }
 
     fn store_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Discover games");
-        ui.add_space(8.0);
-
-        let mut search_requested = false;
-        ui.horizontal(|ui| {
-            let response = ui.add_enabled(
-                !self.store_searching,
-                egui::TextEdit::singleline(&mut self.store_query)
-                    .hint_text("Search Game Jolt games")
-                    .desired_width(360.0),
-            );
-            search_requested =
-                response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            if ui
-                .add_enabled(
-                    !self.store_searching && !self.store_query.trim().is_empty(),
-                    egui::Button::new("Search"),
-                )
-                .clicked()
-            {
-                search_requested = true;
+        let session = self.config.session_cookie.clone();
+        let action = if self.page == Page::Game {
+            self.store.preview_ui(ui, session.as_deref(), self.busy)
+        } else {
+            self.store.ui(ui, session.as_deref())
+        };
+        match action {
+            None => {}
+            Some(StoreAction::OpenGame) => self.navigate_to(Page::Game),
+            Some(StoreAction::ReviewBuilds { game_id, title }) => {
+                self.game_input = game_id.to_string();
+                self.windows_only = false;
+                self.navigate_to(Page::Install);
+                self.status = format!("Reviewing builds for {title}...");
+                self.run_cli(vec!["info".into(), game_id.to_string()]);
             }
-            if self.store_searching {
-                ui.spinner();
+            Some(StoreAction::Install { game_id, title }) => {
+                self.game_input = game_id.to_string();
+                self.run_cli(vec!["install".into(), game_id.to_string()]);
+                if self.busy {
+                    self.status = format!("Installing {title}... this can take a while for large games.");
+                }
             }
-        });
-
-        if search_requested {
-            self.search_store(1);
-        }
-
-        if let Some(error) = &self.store_error {
-            ui.colored_label(egui::Color32::DARK_RED, error);
-        } else if self.store_games.is_empty() && !self.store_searching {
-            ui.add_space(12.0);
-            ui.label(if self.store_query.trim().is_empty() {
-                "Search for a game by title or keyword."
-            } else {
-                "No public games found for this search."
-            });
-        }
-
-        if !self.store_games.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(format!("{} results", self.store_game_count));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let pages = self
-                        .store_game_count
-                        .div_ceil(u64::from(self.store_per_page.max(1)))
-                        .max(1) as u32;
-                    if ui
-                        .add_enabled(
-                            !self.store_searching && self.store_page < pages,
-                            egui::Button::new("Next"),
-                        )
-                        .clicked()
-                    {
-                        search_requested = true;
-                        self.store_page = self.store_page.saturating_add(1);
-                    }
-                    ui.label(format!("{} / {}", self.store_page, pages));
-                    if ui
-                        .add_enabled(
-                            !self.store_searching && self.store_page > 1,
-                            egui::Button::new("Previous"),
-                        )
-                        .clicked()
-                    {
-                        search_requested = true;
-                        self.store_page = self.store_page.saturating_sub(1);
-                    }
-                });
-            });
-        }
-
-        let mut review_game = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for game in self
-                .store_games
-                .iter()
-                .filter(|game| !game.has_adult_content)
-                .cloned()
-            {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if let Some(thumbnail) = game
-                                .img_thumbnail
-                                .as_deref()
-                                .filter(|url| is_gamejolt_thumbnail(url))
-                            {
-                                ui.add(
-                                    egui::Image::from_uri(thumbnail)
-                                        .fit_to_exact_size(egui::vec2(144.0, 81.0)),
-                                );
-                            }
-                            ui.vertical(|ui| {
-                                ui.strong(&game.title);
-                                let developer = game
-                                    .developer
-                                    .as_ref()
-                                    .and_then(|developer| {
-                                        developer
-                                            .display_name
-                                            .as_ref()
-                                            .or(developer.username.as_ref())
-                                    })
-                                    .map(String::as_str)
-                                    .unwrap_or("Unknown creator");
-                                ui.small(format!("{developer}  ·  Game {}", game.id));
-                                if let Some(slug) = game.slug.as_deref() {
-                                    ui.hyperlink_to(
-                                        "Game Jolt page",
-                                        format!("https://gamejolt.com/games/{slug}/{}", game.id),
-                                    );
-                                }
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.button("Review builds").clicked() {
-                                        review_game = Some((game.id, game.title.clone()));
-                                    }
-                                },
-                            );
-                        });
-                    });
-                ui.add_space(4.0);
-            }
-        });
-
-        if search_requested && !self.store_searching {
-            self.search_store(self.store_page);
-        }
-        if let Some((game_id, title)) = review_game {
-            self.game_input = game_id.to_string();
-            self.windows_only = false;
-            self.navigate_to(Page::Install);
-            self.status = format!("Reviewing builds for {title}...");
-            self.run_cli(vec!["info".into(), game_id.to_string()]);
         }
     }
 
@@ -609,29 +435,19 @@ impl JoltuxApp {
 impl eframe::App for JoltuxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(message) = self.receiver.try_recv() {
+            let TaskMessage::Done(message) = message else {
+                if let TaskMessage::Output(output) = message {
+                    self.task_output = output;
+                }
+                continue;
+            };
             self.status = message;
+            self.task_output.clear();
             self.busy = false;
             self.refresh();
         }
-        while let Ok(message) = self.store_receiver.try_recv() {
-            match message {
-                StoreMessage::Search(Ok(payload)) => {
-                    self.store_searching = false;
-                    self.store_games = payload.games;
-                    self.store_game_count = payload.games_count;
-                    self.store_page = payload.page.max(1);
-                    self.store_per_page = payload.per_page.max(1);
-                    self.store_error = None;
-                }
-                StoreMessage::Search(Err(error)) => {
-                    self.store_searching = false;
-                    self.store_games.clear();
-                    self.store_game_count = 0;
-                    self.store_error = Some(format!("Game search failed: {error}"));
-                }
-            }
-        }
-        if self.busy || self.store_searching {
+        self.store.poll();
+        if self.busy || self.store.is_loading() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -649,7 +465,8 @@ impl eframe::App for JoltuxApp {
                     (Page::Account, "Account"),
                     (Page::Settings, "Settings"),
                 ] {
-                    if ui.selectable_label(self.page == page, label).clicked() {
+                    let current = self.page == page || (page == Page::Store && self.page == Page::Game);
+                    if ui.selectable_label(current, label).clicked() {
                         self.navigate_to(page);
                     }
                 }
@@ -666,6 +483,7 @@ impl eframe::App for JoltuxApp {
                 ui.separator();
                 ui.heading(match self.page {
                     Page::Store => "Store",
+                    Page::Game => "Game preview",
                     Page::Library => "Library",
                     Page::Install => "Add a game",
                     Page::Account => "Account",
@@ -675,7 +493,7 @@ impl eframe::App for JoltuxApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.page {
-            Page::Store => self.store_page(ui),
+            Page::Store | Page::Game => self.store_page(ui),
             Page::Library => self.library_page(ui),
             Page::Install => self.install_page(ui),
             Page::Account => self.account_page(ui),
@@ -683,15 +501,33 @@ impl eframe::App for JoltuxApp {
         });
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            let last_line = self.task_output.lines().rev().find(|line| !line.trim().is_empty());
             ui.horizontal(|ui| {
                 if self.busy {
                     ui.spinner();
                 }
+                if self.busy {
+                    ui.label(&self.status);
+                    if let Some(fraction) = last_line.and_then(progress_fraction) {
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .desired_width(ui.available_width().min(360.0))
+                                .text(last_line.unwrap_or_default().trim()),
+                        );
+                    }
+                }
             });
             egui::ScrollArea::vertical()
                 .max_height(90.0)
+                .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    ui.label(&self.status);
+                    if self.busy {
+                        if !self.task_output.trim().is_empty() {
+                            ui.small(self.task_output.trim());
+                        }
+                    } else {
+                        ui.label(&self.status);
+                    }
                 });
         });
     }
@@ -719,29 +555,91 @@ fn login_task(username: String, password: String) -> String {
     result.unwrap_or_else(|error| format!("Login failed: {error:#}"))
 }
 
-fn is_gamejolt_thumbnail(uri: &str) -> bool {
-    reqwest::Url::parse(uri).is_ok_and(|url| {
-        url.scheme() == "https" && matches!(url.host_str(), Some("m.gjcdn.net" | "i.gjcdn.net"))
-    })
+/// Runs a Joltux subcommand in a child process, sending its combined
+/// stdout/stderr to the GUI as it arrives. Returns (succeeded, final output).
+fn run_streaming(args: Vec<String>, sender: &Sender<TaskMessage>) -> Result<(bool, String)> {
+    let exe = std::env::current_exe().context("could not find the Joltux executable")?;
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not start Joltux command")?;
+
+    let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let pipes: Vec<Box<dyn Read + Send>> = vec![
+        Box::new(child.stdout.take().context("missing stdout pipe")?),
+        Box::new(child.stderr.take().context("missing stderr pipe")?),
+    ];
+    let readers: Vec<_> = pipes
+        .into_iter()
+        .map(|mut pipe| {
+            let output = Arc::clone(&output);
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let text = {
+                        let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+                        output.extend_from_slice(&buf[..n]);
+                        collapse_carriage_returns(&String::from_utf8_lossy(&output))
+                    };
+                    let _ = sender.send(TaskMessage::Output(text));
+                }
+            })
+        })
+        .collect();
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let status = child.wait().context("could not wait for Joltux command")?;
+    let output = output.lock().unwrap_or_else(|e| e.into_inner());
+    let text = collapse_carriage_returns(&String::from_utf8_lossy(&output));
+    Ok((status.success(), text.trim().to_owned()))
+}
+
+/// Reads the percentage from a download progress line like
+/// `  1.0 / 3.0 MiB (33%)`.
+fn progress_fraction(line: &str) -> Option<f32> {
+    let line = line.trim_end();
+    let inner = line.strip_suffix("%)")?;
+    let percent: f32 = inner[inner.rfind('(')? + 1..].parse().ok()?;
+    Some((percent / 100.0).clamp(0.0, 1.0))
+}
+
+/// Applies `\r` the way a terminal does: text after a carriage return
+/// overwrites the line, so in-place progress updates collapse to the last one.
+fn collapse_carriage_returns(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            line.rsplit('\r').next().unwrap_or(line).trim_end()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_gamejolt_thumbnail;
+    use super::{collapse_carriage_returns, progress_fraction};
 
     #[test]
-    fn only_loads_https_gamejolt_cdn_thumbnails() {
-        assert!(is_gamejolt_thumbnail(
-            "https://m.gjcdn.net/game-thumbnail/500/123.webp"
-        ));
-        assert!(is_gamejolt_thumbnail(
-            "https://i.gjcdn.net/public-data/games/1/2/3/thumbnail.png"
-        ));
-        assert!(!is_gamejolt_thumbnail(
-            "http://m.gjcdn.net/game-thumbnail/500/123.webp"
-        ));
-        assert!(!is_gamejolt_thumbnail(
-            "https://m.gjcdn.net.example.test/thumbnail.webp"
-        ));
+    fn reads_download_percentage() {
+        assert_eq!(progress_fraction("  1.0 / 4.0 MiB (25%)   "), Some(0.25));
+        assert_eq!(progress_fraction("  12.0 MiB"), None);
+        assert_eq!(progress_fraction("Extracting..."), None);
+    }
+
+    #[test]
+    fn keeps_only_the_last_progress_update() {
+        let output = "Installing Game\n\r  1.0 / 3.0 MiB (33%)   \r  3.0 / 3.0 MiB (100%)   \nExtracting...\r\nDone.";
+        assert_eq!(
+            collapse_carriage_returns(output),
+            "Installing Game\n  3.0 / 3.0 MiB (100%)\nExtracting...\nDone."
+        );
     }
 }

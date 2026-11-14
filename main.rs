@@ -13,6 +13,7 @@ mod models;
 mod paths;
 mod runtime;
 mod select;
+mod store;
 
 use std::fs;
 use std::io::{self, Write};

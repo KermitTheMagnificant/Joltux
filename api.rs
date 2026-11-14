@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderValue, COOKIE, SET_COOKIE};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::models::{GameSearchPayload, PackagePayload};
+use crate::models::{GameDetails, GameInfo, GameMedia, GameSearchPayload, PackagePayload};
 
 pub const USER_AGENT: &str = concat!("Joltux/", env!("CARGO_PKG_VERSION"), " (unofficial Linux launcher)");
 const BASE: &str = "https://gamejolt.com/site-api";
@@ -195,6 +195,54 @@ impl ApiClient {
         serde_json::from_value(payload).context("unexpected shape for game search payload")
     }
 
+    /// Browses public games the way the website's game listings do.
+    /// `section` is "hot", "new", "best" or "featured"; `tag` is a category
+    /// such as "horror" (`None` for all games).
+    pub fn browse_games(&self, section: &str, tag: Option<&str>, page: u32) -> Result<GameSearchPayload> {
+        let mut url = reqwest::Url::parse(&format!("{BASE}/web/discover/games"))
+            .context("invalid Game Jolt browse URL")?;
+        {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("section", section);
+            if let Some(tag) = tag {
+                query_pairs.append_pair("tag", tag);
+            }
+            if page > 1 {
+                query_pairs.append_pair("page", &page.to_string());
+            }
+        }
+        let payload = self.get_url(url)?;
+        let mut result: GameSearchPayload =
+            serde_json::from_value(payload).context("unexpected shape for game listing payload")?;
+        // Listings don't echo the page number back.
+        if result.page == 0 {
+            result.page = page.max(1);
+        }
+        Ok(result)
+    }
+
+    /// A game's description, header image, screenshots and videos.
+    pub fn game_details(&self, game_id: u64) -> Result<GameDetails> {
+        let payload = self.get(&format!("/web/discover/games/{game_id}"))?;
+        let game: GameInfo = serde_json::from_value(payload.get("game").cloned().unwrap_or_default())
+            .context("unexpected shape for game payload")?;
+        let overview = self.get(&format!("/web/discover/games/overview/{game_id}"))?;
+        let media = overview
+            .get("mediaItems")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            // Skip individual items we can't read rather than failing the page.
+            .filter_map(|item| serde_json::from_value::<GameMedia>(item.clone()).ok())
+            .collect();
+        let meta_description = overview
+            .get("metaDescription")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Ok(GameDetails { game, media, meta_description })
+    }
+
     /// All packages, releases, builds and launch options for a game.
     pub fn packages(&self, game_id: u64) -> Result<PackagePayload> {
         let payload = self.get(&format!("/web/discover/games/packages/{game_id}"))?;
@@ -238,5 +286,24 @@ mod tests {
         headers.append(SET_COOKIE, HeaderValue::from_static("other=x; Path=/"));
         headers.append(SET_COOKIE, HeaderValue::from_static("frontend=abc123; Path=/; Secure"));
         assert_eq!(frontend_cookie(&headers).as_deref(), Some("abc123"));
+    }
+
+    /// Hits the live Game Jolt API: `cargo test -- --ignored live_store`.
+    #[test]
+    #[ignore]
+    fn live_store_endpoints() {
+        let api = super::ApiClient::new(None).unwrap();
+        let listing = api.browse_games("hot", Some("horror"), 2).unwrap();
+        assert_eq!(listing.page, 2);
+        assert!(!listing.games.is_empty());
+        let game = &listing.games[0];
+        let details = api.game_details(game.id).unwrap();
+        assert_eq!(details.game.id, game.id);
+        println!(
+            "{} — {} media, {} description blocks",
+            details.game.title,
+            details.media.len(),
+            crate::models::description_blocks(&details.game.description_content).len()
+        );
     }
 }

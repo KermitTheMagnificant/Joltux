@@ -91,13 +91,15 @@ pub struct GameSearchResult {
     #[serde(default, deserialize_with = "lenient_string")]
     pub title: String,
     #[serde(default)]
-    pub slug: Option<String>,
-    #[serde(default)]
     pub img_thumbnail: Option<String>,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub has_adult_content: bool,
     #[serde(default)]
     pub developer: Option<GameDeveloper>,
+    #[serde(default)]
+    pub compatibility: Option<Compatibility>,
+    #[serde(default, deserialize_with = "lenient_option_u64")]
+    pub follower_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +108,195 @@ pub struct GameDeveloper {
     pub display_name: Option<String>,
     #[serde(default)]
     pub username: Option<String>,
+}
+
+impl GameDeveloper {
+    pub fn name(&self) -> Option<&str> {
+        self.display_name.as_deref().or(self.username.as_deref())
+    }
+}
+
+/// Which platforms a game has builds for, summarised across all its builds.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Compatibility {
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_windows: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_windows_64: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_mac: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_mac_64: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_linux: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub os_linux_64: bool,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub type_html: bool,
+}
+
+impl Compatibility {
+    pub fn linux(&self) -> bool {
+        self.os_linux || self.os_linux_64
+    }
+
+    pub fn windows(&self) -> bool {
+        self.os_windows || self.os_windows_64
+    }
+
+    pub fn mac(&self) -> bool {
+        self.os_mac || self.os_mac_64
+    }
+}
+
+/// An uploaded image (header, screenshot, ...) on Game Jolt's media server.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MediaItem {
+    /// A resized copy; the width is a path segment that can be changed.
+    #[serde(default)]
+    pub mediaserver_url: Option<String>,
+}
+
+/// The `game` object of `GET /web/discover/games/:id`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameInfo {
+    #[serde(deserialize_with = "lenient_u64")]
+    pub id: u64,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub title: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub developer: Option<GameDeveloper>,
+    #[serde(default)]
+    pub compatibility: Option<Compatibility>,
+    #[serde(default, deserialize_with = "lenient_option_u64")]
+    pub follower_count: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_option_u64")]
+    pub like_count: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_option_u64")]
+    pub development_status: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub canceled: bool,
+    #[serde(default)]
+    pub header_media_item: Option<MediaItem>,
+    /// A JSON-encoded rich-text document; see `description_blocks`.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub description_content: String,
+}
+
+/// A screenshot or video from `GET /web/discover/games/overview/:id`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameMedia {
+    /// "image", "video" or "sketchfab".
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub media_type: String,
+    /// For videos, the provider ("youtube", "vimeo").
+    #[serde(rename = "type", default, deserialize_with = "lenient_string")]
+    pub provider: String,
+    /// For videos, the provider's video ID.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub url: String,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub title: String,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub caption: String,
+    #[serde(default)]
+    pub img_thumbnail: Option<String>,
+    #[serde(default)]
+    pub media_item: Option<MediaItem>,
+}
+
+impl GameMedia {
+    /// Link to watch a video on its provider's site, if the ID looks sane.
+    pub fn video_link(&self) -> Option<String> {
+        if self.media_type != "video"
+            || self.url.is_empty()
+            || !self.url.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
+        match self.provider.as_str() {
+            "youtube" => Some(format!("https://www.youtube.com/watch?v={}", self.url)),
+            "vimeo" => Some(format!("https://vimeo.com/{}", self.url)),
+            _ => None,
+        }
+    }
+}
+
+/// Everything shown on a game's preview page.
+#[derive(Debug, Clone)]
+pub struct GameDetails {
+    pub game: GameInfo,
+    pub media: Vec<GameMedia>,
+    pub meta_description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescriptionBlock {
+    Heading(String),
+    Paragraph(String),
+    ListItem(String),
+}
+
+/// Flattens a game's rich-text description into headings, paragraphs and
+/// list items. Images, embeds and formatting are dropped.
+pub fn description_blocks(content: &str) -> Vec<DescriptionBlock> {
+    fn inline_text(node: &Value, out: &mut String) {
+        match node.get("type").and_then(Value::as_str) {
+            Some("text") => out.push_str(node.get("text").and_then(Value::as_str).unwrap_or("")),
+            Some("hardBreak") => out.push('\n'),
+            Some("mention") | Some("tag") => {
+                if let Some(text) = node.pointer("/attrs/value").and_then(Value::as_str) {
+                    out.push_str(text);
+                }
+            }
+            _ => {}
+        }
+        for child in node.get("content").and_then(Value::as_array).into_iter().flatten() {
+            inline_text(child, out);
+        }
+    }
+
+    fn walk(node: &Value, out: &mut Vec<DescriptionBlock>) {
+        let kind = node.get("type").and_then(Value::as_str).unwrap_or("");
+        let text = || {
+            let mut text = String::new();
+            inline_text(node, &mut text);
+            text.trim().to_owned()
+        };
+        match kind {
+            "heading" => {
+                let text = text();
+                if !text.is_empty() {
+                    out.push(DescriptionBlock::Heading(text));
+                }
+            }
+            "paragraph" | "codeBlock" => {
+                let text = text();
+                if !text.is_empty() {
+                    out.push(DescriptionBlock::Paragraph(text));
+                }
+            }
+            "listItem" => {
+                let text = text();
+                if !text.is_empty() {
+                    out.push(DescriptionBlock::ListItem(text));
+                }
+            }
+            _ => {
+                for child in node.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    walk(child, out);
+                }
+            }
+        }
+    }
+
+    let mut blocks = Vec::new();
+    if let Ok(doc) = serde_json::from_str::<Value>(content) {
+        walk(&doc, &mut blocks);
+    }
+    blocks
 }
 
 /// A "package" is a named group of releases (e.g. "Demo", "Full game").
@@ -214,7 +405,48 @@ pub struct InstalledGame {
 
 #[cfg(test)]
 mod tests {
-    use super::{GameSearchPayload, PackagePayload};
+    use super::{description_blocks, DescriptionBlock, GameMedia, GameSearchPayload, PackagePayload};
+
+    #[test]
+    fn flattens_rich_text_description() {
+        let doc = r#"{"version":"4","content":[
+            {"type":"heading","content":[{"type":"text","text":"Features"}]},
+            {"type":"paragraph","content":[
+                {"type":"text","text":"Line one"},{"type":"hardBreak"},
+                {"type":"text","marks":[{"type":"strong"}],"text":"line two"}]},
+            {"type":"paragraph","content":[{"type":"gif"}]},
+            {"type":"bulletList","content":[{"type":"listItem","content":[
+                {"type":"paragraph","content":[{"type":"text","text":"Fast"}]}]}]}
+        ]}"#;
+        assert_eq!(
+            description_blocks(doc),
+            vec![
+                DescriptionBlock::Heading("Features".into()),
+                DescriptionBlock::Paragraph("Line one\nline two".into()),
+                DescriptionBlock::ListItem("Fast".into()),
+            ]
+        );
+        assert!(description_blocks("not json").is_empty());
+    }
+
+    #[test]
+    fn builds_video_links_only_for_safe_ids() {
+        let video = |provider: &str, url: &str| GameMedia {
+            media_type: "video".into(),
+            provider: provider.into(),
+            url: url.into(),
+            title: String::new(),
+            caption: String::new(),
+            img_thumbnail: None,
+            media_item: None,
+        };
+        assert_eq!(
+            video("youtube", "R8Ud2e-LB20").video_link().as_deref(),
+            Some("https://www.youtube.com/watch?v=R8Ud2e-LB20")
+        );
+        assert_eq!(video("youtube", "x&list=1").video_link(), None);
+        assert_eq!(video("other", "abc").video_link(), None);
+    }
 
     #[test]
     fn parses_game_search_results_and_pagination() {

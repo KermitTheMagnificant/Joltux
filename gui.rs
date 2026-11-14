@@ -11,6 +11,7 @@ use crate::config::{Config, Runner};
 use crate::library::Library;
 use crate::models::InstalledGame;
 use crate::paths::Paths;
+use crate::runtime;
 use crate::store::{Store, StoreAction};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -583,6 +584,7 @@ fn run_streaming(args: Vec<String>, sender: &Sender<TaskMessage>) -> Result<(boo
     let exe = std::env::current_exe().context("could not find the Joltux executable")?;
     let mut child = Command::new(exe)
         .args(args)
+        .env(runtime::GRAPHICAL_AUTH_ENV, "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

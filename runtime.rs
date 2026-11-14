@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::api::USER_AGENT;
+use crate::checks;
 use crate::config::{Config, Runner};
 use crate::paths::Paths;
 
@@ -38,20 +39,57 @@ impl PackageManager {
         }
     }
 
-    fn arguments(self) -> &'static [&'static str] {
+    /// Arguments that install packages without asking questions.
+    fn install_arguments(self) -> &'static [&'static str] {
         match self {
-            Self::Apt => &["install", "-y", "wine"],
-            Self::Dnf => &["install", "-y", "wine"],
-            Self::Pacman => &["-S", "--needed", "--noconfirm", "wine"],
-            Self::Zypper => &["--non-interactive", "install", "wine"],
+            Self::Apt => &["install", "-y"],
+            Self::Dnf => &["install", "-y"],
+            Self::Pacman => &["-S", "--needed", "--noconfirm"],
+            Self::Zypper => &["--non-interactive", "install"],
+        }
+    }
+
+    /// 32-bit C library, Vulkan loader and Mesa drivers. Proton's container
+    /// needs the 32-bit loader to set up graphics for 32-bit games, which
+    /// most Windows games on Game Jolt are.
+    fn lib32_packages(self) -> &'static [&'static str] {
+        match self {
+            Self::Apt => &[
+                "libc6:i386",
+                "libvulkan1:i386",
+                "mesa-vulkan-drivers:i386",
+                "libgl1:i386",
+                "libgl1-mesa-dri:i386",
+            ],
+            Self::Dnf => &[
+                "glibc.i686",
+                "vulkan-loader.i686",
+                "mesa-vulkan-drivers.i686",
+                "mesa-dri-drivers.i686",
+                "libglvnd-glx.i686",
+            ],
+            Self::Pacman => &[
+                "lib32-glibc",
+                "lib32-vulkan-icd-loader",
+                "lib32-mesa",
+                "lib32-vulkan-radeon",
+                "lib32-vulkan-intel",
+            ],
+            Self::Zypper => &[
+                "glibc-32bit",
+                "libvulkan1-32bit",
+                "Mesa-libGL1-32bit",
+                "Mesa-dri-32bit",
+                "libvulkan_radeon-32bit",
+                "libvulkan_intel-32bit",
+            ],
         }
     }
 }
 
 pub fn setup(paths: &Paths, config: &mut Config) -> Result<()> {
     let manager = detect_package_manager()?;
-    println!("Installing Wine using {}...", manager.executable());
-    install_system_wine(manager)?;
+    install_system_packages(manager)?;
 
     println!("Installing the latest umu-launcher for this user...");
     let umu_path = install_umu(paths)?;
@@ -61,7 +99,125 @@ pub fn setup(paths: &Paths, config: &mut Config) -> Result<()> {
     config.wine_path = "wine".to_string();
     config.proton_path = "GE-Proton".to_string();
     config.save(paths)?;
+
+    let problems = checks::find_problems(true);
+    if !problems.is_empty() {
+        eprintln!("Setup finished, but games may still fail to start:");
+        for problem in problems {
+            eprintln!("  - {problem}");
+        }
+    }
     Ok(())
+}
+
+/// Installs Wine plus the 32-bit graphics libraries that 32-bit Windows games
+/// need. Everything goes in one package-manager run when possible, so the
+/// user is asked for their password once. Only a Wine failure is fatal: 64-bit
+/// and native games work without the 32-bit libraries, and the launcher
+/// explains what is missing if a game later fails.
+fn install_system_packages(manager: PackageManager) -> Result<()> {
+    let (lib32, nvidia) = match prepare_lib32(manager) {
+        Ok(()) => (
+            manager.lib32_packages().iter().map(|p| p.to_string()).collect(),
+            nvidia_lib32_package(manager),
+        ),
+        Err(error) => {
+            eprintln!("Warning: skipping 32-bit graphics libraries: {error:#}");
+            (Vec::new(), None)
+        }
+    };
+
+    println!(
+        "Installing Wine and 32-bit graphics libraries using {}...",
+        manager.executable()
+    );
+    let mut all = vec!["wine".to_string()];
+    all.extend(lib32.iter().cloned());
+    all.extend(nvidia.clone());
+    if install_packages(manager, &all).is_ok() {
+        return Ok(());
+    }
+
+    // One unavailable package fails the whole run, so retry in steps to find
+    // which part is the problem.
+    eprintln!("Retrying the installation one part at a time...");
+    install_packages(manager, &["wine"]).context("Wine installation failed")?;
+    if lib32.is_empty() {
+        return Ok(());
+    }
+    if let Err(error) = install_packages(manager, &lib32) {
+        eprintln!("Warning: could not install 32-bit graphics libraries: {error:#}");
+        return Ok(());
+    }
+    if let Some(nvidia) = nvidia {
+        if install_packages(manager, &[&nvidia]).is_err() {
+            eprintln!(
+                "Warning: could not install the 32-bit NVIDIA driver package `{nvidia}`; install \
+                 it with your package manager to run 32-bit games on your NVIDIA GPU"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Makes 32-bit packages installable, where the distro needs that first.
+fn prepare_lib32(manager: PackageManager) -> Result<()> {
+    match manager {
+        PackageManager::Apt => run_checked(
+            // One privileged command so the user is only asked once.
+            privileged("sh")?.args(["-c", "dpkg --add-architecture i386 && apt-get update"]),
+            "could not enable 32-bit (i386) packages",
+        ),
+        PackageManager::Pacman => {
+            let conf = fs::read_to_string("/etc/pacman.conf").unwrap_or_default();
+            if !conf.lines().any(|line| line.trim() == "[multilib]") {
+                bail!(
+                    "they need the multilib repository; enable [multilib] in /etc/pacman.conf \
+                     and run `joltux setup` again"
+                );
+            }
+            Ok(())
+        }
+        PackageManager::Dnf | PackageManager::Zypper => Ok(()),
+    }
+}
+
+/// The 32-bit counterpart of the installed proprietary NVIDIA GL package, if
+/// any. It has to come from the same repository and match its version.
+fn nvidia_lib32_package(manager: PackageManager) -> Option<String> {
+    match manager {
+        PackageManager::Dnf => ["xorg-x11-drv-nvidia-libs", "nvidia-driver-libs"]
+            .into_iter()
+            .find(|name| query_succeeds("rpm", &["-q", name]))
+            .map(|name| format!("{name}.i686")),
+        PackageManager::Zypper => ["nvidia-gl-G06", "nvidia-gl-G05"]
+            .into_iter()
+            .find(|name| query_succeeds("rpm", &["-q", name]))
+            .map(|name| format!("{name}-32bit")),
+        PackageManager::Pacman => query_succeeds("pacman", &["-Q", "nvidia-utils"])
+            .then(|| "lib32-nvidia-utils".to_string()),
+        PackageManager::Apt => {
+            // Ubuntu and Debian name it after the driver branch: libnvidia-gl-550.
+            let out = Command::new("dpkg-query")
+                .args(["-W", "-f", "${Package} ${db:Status-Status}\n", "libnvidia-gl-*"])
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                let (name, status) = line.split_once(' ')?;
+                (status == "installed").then(|| format!("{name}:i386"))
+            })
+        }
+    }
+}
+
+fn query_succeeds(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn detect_package_manager() -> Result<PackageManager> {
@@ -115,25 +271,38 @@ fn package_manager_for(os_release: &str) -> Option<PackageManager> {
     }
 }
 
-fn install_system_wine(manager: PackageManager) -> Result<()> {
-    let mut command = if is_root() {
-        Command::new(manager.executable())
+fn install_packages<S: AsRef<std::ffi::OsStr>>(manager: PackageManager, packages: &[S]) -> Result<()> {
+    let mut command = privileged(manager.executable())?;
+    command.args(manager.install_arguments()).args(packages);
+    run_checked(&mut command, "the package manager could not install the packages")
+}
+
+/// Set by the GUI on the commands it runs. There is no terminal for sudo to
+/// ask for a password, so root commands go through pkexec, which shows the
+/// desktop's own password dialog.
+pub const GRAPHICAL_AUTH_ENV: &str = "JOLTUX_GRAPHICAL_AUTH";
+
+/// A command that runs as root: directly if Joltux already is root, through
+/// pkexec when run from the GUI, otherwise through sudo.
+fn privileged(program: &str) -> Result<Command> {
+    if is_root() {
+        return Ok(Command::new(program));
+    }
+    let graphical = std::env::var_os(GRAPHICAL_AUTH_ENV).is_some();
+    let helper = if graphical {
+        if !command_exists("pkexec") {
+            bail!("pkexec (polkit) is required to install system packages from the app; run `joltux setup` in a terminal instead");
+        }
+        "pkexec"
     } else {
         if !command_exists("sudo") {
-            bail!("sudo is required to install Wine; run the package-manager command manually");
+            bail!("sudo is required to install system packages; run the package-manager command manually");
         }
-        let mut command = Command::new("sudo");
-        command.arg(manager.executable());
-        command
+        "sudo"
     };
-    command.args(manager.arguments());
-    let status = command
-        .status()
-        .context("could not start the system package manager")?;
-    if !status.success() {
-        bail!("Wine installation failed (package manager exited with {status})");
-    }
-    Ok(())
+    let mut command = Command::new(helper);
+    command.arg(program);
+    Ok(command)
 }
 
 fn is_root() -> bool {

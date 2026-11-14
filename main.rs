@@ -4,6 +4,7 @@
 //! Windows builds through Proton (via umu-launcher) or Wine.
 
 mod api;
+mod checks;
 mod config;
 mod gui;
 mod install;

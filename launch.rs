@@ -7,6 +7,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::checks;
 use crate::config::{Config, Runner};
 use crate::models::InstalledGame;
 use crate::paths::Paths;
@@ -44,7 +45,28 @@ pub fn run(game: &InstalledGame, config: &Config, paths: &Paths) -> Result<()> {
         Err(e) => return Err(e).context("failed to start game"),
     };
     eprintln!("{} exited ({status})", game.title);
+    if !status.success() {
+        explain_failure(game.platform, config.runner);
+    }
     Ok(())
+}
+
+/// Prints likely causes after a game exits with an error.
+fn explain_failure(platform: Platform, runner: Runner) {
+    let problems = checks::find_problems(platform == Platform::Windows);
+    if problems.is_empty() {
+        if (platform, runner) == (Platform::Windows, Runner::Umu) {
+            eprintln!(
+                "No known system problem was found. For a detailed log, launch from a terminal \
+                 with PROTON_LOG=1 set; Proton writes it to ~/steam-0.log."
+            );
+        }
+        return;
+    }
+    eprintln!("Possible causes:");
+    for problem in problems {
+        eprintln!("  - {problem}");
+    }
 }
 
 fn native_command(exe: &Path) -> Result<Command> {

@@ -1,6 +1,6 @@
 # Joltux: unofficial Game Jolt launcher for Linux
 # AI WARNING: 
-## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass!)
+## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass)
 Downloads games from Game Jolt and runs them from one place. Prefers native
 Linux builds; falls back to Windows builds run through Proton (via
 [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)) or Wine.

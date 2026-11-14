@@ -62,8 +62,6 @@ fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 #[derive(Debug, Default, Deserialize)]
 pub struct PackagePayload {
     #[serde(default)]
-    pub packages: Vec<Package>,
-    #[serde(default)]
     pub releases: Vec<Release>,
     #[serde(default)]
     pub builds: Vec<Build>,
@@ -299,37 +297,22 @@ pub fn description_blocks(content: &str) -> Vec<DescriptionBlock> {
     blocks
 }
 
-/// A "package" is a named group of releases (e.g. "Demo", "Full game").
-#[derive(Debug, Clone, Deserialize)]
-pub struct Package {
-    #[serde(deserialize_with = "lenient_u64")]
-    pub id: u64,
-    #[serde(default)]
-    pub title: Option<String>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
-    #[serde(default, deserialize_with = "lenient_u64")]
-    pub game_package_id: u64,
     #[serde(default, deserialize_with = "lenient_string")]
     pub version_number: String,
     /// The official client sorts releases by this ascending and takes the
     /// first match, so lower = preferred.
     #[serde(default)]
     pub sort: i64,
-    #[serde(default, deserialize_with = "lenient_string")]
-    pub status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Build {
     #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
-    #[serde(default, deserialize_with = "lenient_u64")]
-    pub game_package_id: u64,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub game_release_id: u64,
     /// "downloadable", "html", "flash", "unity", "applet", "rom", ...
@@ -343,10 +326,6 @@ pub struct Build {
     pub os_windows: bool,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub os_windows_64: bool,
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub os_mac: bool,
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub os_mac_64: bool,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub os_linux: bool,
     #[serde(default, deserialize_with = "lenient_bool")]
@@ -500,8 +479,8 @@ mod tests {
                 )
                 .unwrap();
 
-        assert_eq!(payload.packages[0].id, 258246645);
-        assert_eq!(payload.releases[0].game_package_id, 258246645);
+        assert_eq!(payload.releases[0].id, 10);
+        assert_eq!(payload.releases[0].version_number, "");
         assert_eq!(payload.builds[0].game_release_id, 10);
         assert_eq!(
             payload.builds[0].primary_file.as_ref().unwrap().filesize,

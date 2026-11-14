@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/joltux-logo.svg" alt="Joltux" width="420">
+</p>
+
 # Joltux: unofficial Game Jolt launcher for Linux
 # AI WARNING: 
 ## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass)

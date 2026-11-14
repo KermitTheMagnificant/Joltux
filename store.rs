@@ -10,10 +10,14 @@ use crate::models::{
     description_blocks, Compatibility, DescriptionBlock, GameDetails, GameMedia, GameSearchPayload,
     GameSearchResult,
 };
+use crate::theme::{self, icon, AccentButton};
 
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(16, 120, 104);
-const CARD_MIN_WIDTH: f32 = 210.0;
-const CARD_GAP: f32 = 12.0;
+const CARD_MIN_WIDTH: f32 = 220.0;
+const CARD_GAP: f32 = 14.0;
+/// Height of the text area under a card's thumbnail.
+const CARD_TEXT_HEIGHT: f32 = 82.0;
+/// How far a card rises when hovered.
+const CARD_LIFT: f32 = 4.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Section {
@@ -250,14 +254,14 @@ impl Store {
         // Search bar and sort order.
         ui.horizontal(|ui| {
             let response = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("Search Game Jolt games")
+                theme::field(&mut self.query)
+                    .hint_text(format!("{}  Search Game Jolt games", icon::SEARCH))
                     .desired_width(320.0),
             );
             let submitted =
                 response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
             if (ui
-                .add_enabled(!self.query.trim().is_empty(), egui::Button::new("Search"))
+                .add_enabled(!self.query.trim().is_empty(), AccentButton::new("Search"))
                 .clicked()
                 || submitted)
                 && !self.query.trim().is_empty()
@@ -275,15 +279,8 @@ impl Store {
                 let browsing = self.listing == Listing::Browse;
                 let before = self.section;
                 ui.add_enabled_ui(browsing, |ui| {
-                    egui::ComboBox::from_id_salt("store_sort")
-                        .selected_text(self.section.label())
-                        .width(110.0)
-                        .show_ui(ui, |ui| {
-                            for section in Section::ALL {
-                                ui.selectable_value(&mut self.section, section, section.label());
-                            }
-                        });
-                    ui.label("Sort by");
+                    let options = Section::ALL.map(|section| (section, section.label()));
+                    theme::segmented(ui, "store_sort", &mut self.section, &options);
                 })
                 .response
                 .on_disabled_hover_text("Sorting applies when browsing, not to search results");
@@ -294,12 +291,12 @@ impl Store {
         });
 
         // Category chips.
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             for (index, (label, _)) in CATEGORIES.iter().enumerate() {
                 let selected = self.listing == Listing::Browse && self.category == index;
-                if ui.selectable_label(selected, *label).clicked() && !selected {
+                if theme::chip(ui, selected, label).clicked() && !selected {
                     self.category = index;
                     if matches!(self.listing, Listing::Search(_)) {
                         self.query.clear();
@@ -317,12 +314,19 @@ impl Store {
             .div_ceil(u64::from(self.per_page.max(1)))
             .clamp(1, u64::from(u32::MAX)) as u32;
         ui.horizontal(|ui| {
-            ui.strong(self.heading_text());
+            ui.label(
+                egui::RichText::new(self.heading_text())
+                    .size(18.0)
+                    .color(egui::Color32::WHITE),
+            );
             if self.game_count > 0 {
-                ui.label(format!("· {} games", thousands(self.game_count)));
+                ui.label(
+                    egui::RichText::new(format!("{} games", thousands(self.game_count)))
+                        .color(theme::TEXT_DIM),
+                );
             }
             if self.loading {
-                ui.spinner();
+                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT_BRIGHT));
             }
             if !self.games.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -332,7 +336,10 @@ impl Store {
                     {
                         reload = Some(self.page + 1);
                     }
-                    ui.label(format!("Page {} of {}", self.page, thousands(u64::from(pages))));
+                    ui.label(
+                        egui::RichText::new(format!("Page {} of {}", self.page, thousands(u64::from(pages))))
+                            .color(theme::TEXT_DIM),
+                    );
                     if ui
                         .add_enabled(!self.loading && self.page > 1, egui::Button::new("‹ Previous"))
                         .clicked()
@@ -345,16 +352,19 @@ impl Store {
         ui.add_space(6.0);
 
         if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::DARK_RED, error);
+            ui.colored_label(theme::DANGER, error);
             if ui.button("Try again").clicked() {
                 reload = Some(self.page);
             }
         } else if self.games.is_empty() && !self.loading {
             ui.add_space(12.0);
-            ui.label(match self.listing {
-                Listing::Search(_) => "No public games found for this search.",
-                Listing::Browse => "No games in this category.",
-            });
+            ui.label(
+                egui::RichText::new(match self.listing {
+                    Listing::Search(_) => "No public games found for this search.",
+                    Listing::Browse => "No games in this category.",
+                })
+                .color(theme::TEXT_DIM),
+            );
         }
 
         let mut opened = None;
@@ -362,6 +372,17 @@ impl Store {
             .id_salt(("store_grid", self.request))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // Room for the top row of cards to rise on hover without clipping.
+                ui.add_space(CARD_LIFT);
+                if self.loading && self.games.is_empty() {
+                    skeleton_grid(ui);
+                    return;
+                }
+                // The old page dims while the next one loads.
+                let dim = ui
+                    .ctx()
+                    .animate_bool_with_time(egui::Id::new("store_grid_dim"), self.loading, 0.2);
+                ui.multiply_opacity(1.0 - 0.6 * dim);
                 opened = game_grid(ui, &self.games).map(|game| (game.id, game.title.clone()));
             });
 
@@ -386,15 +407,15 @@ impl Store {
 
         match &preview.state {
             DetailState::Loading => {
-                ui.heading(&title);
+                ui.heading(egui::RichText::new(&title).color(egui::Color32::WHITE));
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Loading game details...");
+                    ui.add(egui::Spinner::new().size(16.0).color(theme::ACCENT_BRIGHT));
+                    ui.label(egui::RichText::new("Loading game details...").color(theme::TEXT_DIM));
                 });
             }
             DetailState::Failed(error) => {
-                ui.heading(&title);
-                ui.colored_label(egui::Color32::DARK_RED, format!("Could not load this game: {error}"));
+                ui.heading(egui::RichText::new(&title).color(egui::Color32::WHITE));
+                ui.colored_label(theme::DANGER, format!("Could not load this game: {error}"));
                 ui.horizontal(|ui| {
                     retry = ui.button("Try again").clicked();
                     action = install_buttons(ui, game_id, &title, busy);
@@ -418,14 +439,19 @@ impl Store {
     }
 }
 
+/// How many cards fit across `available` pixels, and how wide each one is.
+fn grid_columns(available: f32) -> (usize, f32) {
+    let columns = (((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor() as usize).max(1);
+    let card_width = (available - CARD_GAP * (columns as f32 - 1.0)) / columns as f32;
+    (columns, card_width)
+}
+
 /// Lays games out as a responsive grid of cards; returns the clicked game.
 fn game_grid<'a>(ui: &mut egui::Ui, games: &'a [GameSearchResult]) -> Option<&'a GameSearchResult> {
     let visible: Vec<&GameSearchResult> = games.iter().filter(|game| !game.has_adult_content).collect();
-    let available = ui.available_width();
-    let columns = (((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP)).floor() as usize).max(1);
-    let card_width = (available - CARD_GAP * (columns as f32 - 1.0)) / columns as f32;
+    let (columns, card_width) = grid_columns(ui.available_width());
     let thumb_height = card_width * 9.0 / 16.0;
-    let card_size = egui::vec2(card_width, thumb_height + 78.0);
+    let card_size = egui::vec2(card_width, thumb_height + CARD_TEXT_HEIGHT);
 
     let mut clicked = None;
     for row in visible.chunks(columns) {
@@ -437,41 +463,83 @@ fn game_grid<'a>(ui: &mut egui::Ui, games: &'a [GameSearchResult]) -> Option<&'a
                 }
             }
         });
-        ui.add_space(CARD_GAP);
+        ui.add_space(CARD_GAP - ui.spacing().item_spacing.y);
     }
     clicked
 }
 
+/// Softly pulsing card outlines shown while the first page of games loads.
+fn skeleton_grid(ui: &mut egui::Ui) {
+    let (columns, card_width) = grid_columns(ui.available_width());
+    let thumb_height = card_width * 9.0 / 16.0;
+    let card_size = egui::vec2(card_width, thumb_height + CARD_TEXT_HEIGHT);
+    let time = ui.input(|input| input.time) as f32;
+    let radius = egui::CornerRadius::same(12);
+
+    for row in 0..3 {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = CARD_GAP;
+            for column in 0..columns {
+                // Each card is slightly out of step, so the pulse sweeps across.
+                let phase = time * 3.0 - (row + column) as f32 * 0.45;
+                let pulse = 0.5 + 0.5 * phase.sin();
+                let (rect, _) = ui.allocate_exact_size(card_size, egui::Sense::hover());
+                let painter = ui.painter();
+                painter.rect_filled(rect, radius, theme::SURFACE);
+                let thumb = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), thumb_height));
+                painter.rect_filled(
+                    thumb,
+                    egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 },
+                    theme::mix(theme::SURFACE, theme::SURFACE_HI, pulse),
+                );
+                let bar = |top: f32, width: f32| {
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + 12.0, thumb.bottom() + top),
+                        egui::vec2(rect.width() * width, 10.0),
+                    )
+                };
+                let bar_color = theme::mix(theme::SURFACE_HI, theme::BORDER, pulse);
+                painter.rect_filled(bar(16.0, 0.6), egui::CornerRadius::same(5), bar_color);
+                painter.rect_filled(bar(36.0, 0.35), egui::CornerRadius::same(5), bar_color);
+            }
+        });
+        ui.add_space(CARD_GAP - ui.spacing().item_spacing.y);
+    }
+}
+
 fn game_card(ui: &mut egui::Ui, game: &GameSearchResult, size: egui::Vec2, thumb_height: f32) -> bool {
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (slot, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if !ui.is_rect_visible(rect) {
+    if !ui.is_rect_visible(slot.expand(CARD_LIFT)) {
         return response.clicked();
     }
-    let visuals = ui.visuals();
-    let radius = egui::CornerRadius::same(8);
-    ui.painter().rect_filled(rect, radius, visuals.window_fill);
-    let stroke = if response.hovered() {
-        egui::Stroke::new(2.0_f32, ACCENT)
-    } else {
-        visuals.widgets.noninteractive.bg_stroke
-    };
+
+    // On hover the card rises, gains a shadow and its border turns teal.
+    let hover = theme::ease_out(ui.ctx().animate_bool_with_time(response.id, response.hovered(), 0.16));
+    let rect = slot.translate(egui::vec2(0.0, -CARD_LIFT * hover));
+    let radius = egui::CornerRadius::same(12);
+    let top_radius = egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 };
+    if hover > 0.0 {
+        let shadow = egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: egui::Color32::from_black_alpha((110.0 * hover) as u8),
+        };
+        ui.painter().add(shadow.as_shape(rect, radius));
+    }
+    ui.painter()
+        .rect_filled(rect, radius, theme::mix(theme::SURFACE, theme::SURFACE_HI, hover));
 
     let thumb_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), thumb_height));
-    ui.painter().rect_filled(
-        thumb_rect,
-        egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 },
-        visuals.extreme_bg_color,
-    );
+    ui.painter().rect_filled(thumb_rect, top_radius, theme::SIDEBAR);
     if let Some(url) = game.img_thumbnail.as_deref().filter(|url| is_gamejolt_media(url)) {
-        egui::Image::from_uri(url)
-            .corner_radius(egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 })
-            .paint_at(ui, thumb_rect);
+        egui::Image::from_uri(url).corner_radius(top_radius).paint_at(ui, thumb_rect);
     }
 
     let text_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x + 10.0, thumb_rect.max.y + 8.0),
-        rect.max - egui::vec2(10.0, 6.0),
+        egui::pos2(rect.min.x + 12.0, thumb_rect.max.y + 10.0),
+        rect.max - egui::vec2(12.0, 8.0),
     );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -479,27 +547,43 @@ fn game_card(ui: &mut egui::Ui, game: &GameSearchResult, size: egui::Vec2, thumb
             .layout(egui::Layout::top_down(egui::Align::Min)),
     );
     child.spacing_mut().item_spacing.y = 3.0;
-    child.add(egui::Label::new(egui::RichText::new(&game.title).strong()).truncate().selectable(false));
+    // Keeps the badge row as short as the badges instead of button height.
+    child.spacing_mut().interact_size.y = 18.0;
+    child.add(
+        egui::Label::new(egui::RichText::new(&game.title).color(egui::Color32::WHITE))
+            .truncate()
+            .selectable(false),
+    );
     let developer = game
         .developer
         .as_ref()
         .and_then(|developer| developer.name())
         .unwrap_or("Unknown creator");
     child.add(
-        egui::Label::new(egui::RichText::new(developer).small().weak())
+        egui::Label::new(egui::RichText::new(developer).small().color(theme::TEXT_DIM))
             .truncate()
             .selectable(false),
     );
+    child.add_space(2.0);
     child.horizontal(|ui| {
         platform_badges(ui, game.compatibility.as_ref());
         if let Some(followers) = game.follower_count.filter(|count| *count > 0) {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(format!("♥ {}", compact(followers))).small().weak());
+                ui.label(
+                    egui::RichText::new(format!("{} {}", icon::HEART, compact(followers)))
+                        .small()
+                        .color(theme::TEXT_DIM),
+                );
             });
         }
     });
 
-    ui.painter().rect_stroke(rect, radius, stroke, egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        egui::Stroke::new(1.0_f32 + hover * 0.5, theme::mix(theme::BORDER, theme::ACCENT, hover)),
+        egui::StrokeKind::Inside,
+    );
     response.clicked()
 }
 
@@ -509,38 +593,22 @@ fn platform_badges(ui: &mut egui::Ui, compatibility: Option<&Compatibility>) {
     };
     ui.spacing_mut().item_spacing.x = 4.0;
     if compat.linux() {
-        badge(ui, "Linux", ACCENT);
+        theme::badge(ui, "Linux", theme::ACCENT_BRIGHT);
     }
     if compat.windows() {
-        badge(ui, "Windows", egui::Color32::from_rgb(52, 101, 164));
+        theme::badge(ui, "Windows", theme::BLUE);
     }
     if compat.mac() {
-        badge(ui, "Mac", egui::Color32::from_rgb(110, 110, 110));
+        theme::badge(ui, "Mac", theme::TEXT_DIM);
     }
     if compat.type_html {
-        badge(ui, "Web", egui::Color32::from_rgb(196, 110, 20));
+        theme::badge(ui, "Web", theme::AMBER);
     }
-}
-
-fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    egui::Frame::new()
-        .fill(color.gamma_multiply(0.15))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).small().color(color));
-        });
 }
 
 fn install_buttons(ui: &mut egui::Ui, game_id: u64, title: &str, busy: bool) -> Option<StoreAction> {
     let mut action = None;
-    if ui
-        .add_enabled(
-            !busy,
-            egui::Button::new(egui::RichText::new("Install").color(egui::Color32::WHITE)).fill(ACCENT),
-        )
-        .clicked()
-    {
+    if ui.add_enabled(!busy, AccentButton::new("Install")).clicked() {
         action = Some(StoreAction::Install { game_id, title: title.to_owned() });
     }
     if ui.add_enabled(!busy, egui::Button::new("Review builds")).clicked() {
@@ -568,12 +636,12 @@ fn details_body(
             egui::Image::from_uri(header)
                 .max_width(width)
                 .max_height(220.0)
-                .corner_radius(egui::CornerRadius::same(8)),
+                .corner_radius(egui::CornerRadius::same(12)),
         );
         ui.add_space(10.0);
     }
 
-    ui.heading(egui::RichText::new(&game.title).strong());
+    ui.label(egui::RichText::new(&game.title).size(28.0).color(egui::Color32::WHITE));
     ui.horizontal_wrapped(|ui| {
         let developer = game.developer.as_ref().and_then(|d| d.name()).unwrap_or("Unknown creator");
         ui.label(format!("by {developer}"));
@@ -589,7 +657,11 @@ fn details_body(
     });
     ui.horizontal(|ui| platform_badges(ui, game.compatibility.as_ref()));
     if game.compatibility.as_ref().is_some_and(|c| !c.linux() && !c.windows()) {
-        ui.small("This game has no Linux or Windows builds, so Joltux may not be able to install it.");
+        ui.label(
+            egui::RichText::new("This game has no Linux or Windows builds, so Joltux may not be able to install it.")
+                .small()
+                .color(theme::AMBER),
+        );
     }
     ui.add_space(8.0);
 
@@ -612,7 +684,7 @@ fn details_body(
         ui.add_space(14.0);
     }
 
-    ui.label(egui::RichText::new("About this game").heading().size(18.0));
+    ui.label(egui::RichText::new("About this game").size(18.0).color(egui::Color32::WHITE));
     ui.add_space(4.0);
     let blocks = description_blocks(&game.description_content);
     if blocks.is_empty() {
@@ -626,7 +698,7 @@ fn details_body(
         match block {
             DescriptionBlock::Heading(text) => {
                 ui.add_space(6.0);
-                ui.strong(text);
+                ui.label(egui::RichText::new(text).size(16.0).color(egui::Color32::WHITE));
             }
             DescriptionBlock::Paragraph(text) => {
                 ui.label(text);
@@ -649,7 +721,7 @@ fn media_viewer(ui: &mut egui::Ui, media: &[&GameMedia], selected: &mut usize, w
     let view_width = width.min(900.0);
     let view_size = egui::vec2(view_width, view_width * 9.0 / 16.0);
     let (rect, _) = ui.allocate_exact_size(view_size, egui::Sense::hover());
-    ui.painter().rect_filled(rect, egui::CornerRadius::same(8), egui::Color32::from_gray(24));
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(12), theme::SIDEBAR);
     if let Some(url) = media_preview_url(item, 900) {
         let image = egui::Image::from_uri(url).maintain_aspect_ratio(true).fit_to_exact_size(view_size);
         // Centre the image inside the dark frame.
@@ -660,7 +732,7 @@ fn media_viewer(ui: &mut egui::Ui, media: &[&GameMedia], selected: &mut usize, w
     }
     if let Some(link) = item.video_link() {
         let label = if item.title.is_empty() { "Watch video" } else { item.title.as_str() };
-        ui.hyperlink_to(format!("▶ {label}"), link);
+        ui.hyperlink_to(format!("{} {label}", icon::PLAY), link);
     } else if !item.caption.is_empty() {
         ui.small(&item.caption);
     }
@@ -676,17 +748,17 @@ fn media_viewer(ui: &mut egui::Ui, media: &[&GameMedia], selected: &mut usize, w
                         let size = egui::vec2(128.0, 72.0);
                         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
                         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-                        ui.painter().rect_filled(rect, egui::CornerRadius::same(4), egui::Color32::from_gray(24));
+                        ui.painter().rect_filled(rect, egui::CornerRadius::same(6), theme::SIDEBAR);
                         if let Some(url) = media_preview_url(item, 400) {
                             egui::Image::from_uri(url)
-                                .corner_radius(egui::CornerRadius::same(4))
+                                .corner_radius(egui::CornerRadius::same(6))
                                 .paint_at(ui, rect);
                         }
                         if item.media_type == "video" {
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                "▶",
+                                icon::PLAY,
                                 egui::FontId::proportional(22.0),
                                 egui::Color32::WHITE,
                             );
@@ -694,8 +766,8 @@ fn media_viewer(ui: &mut egui::Ui, media: &[&GameMedia], selected: &mut usize, w
                         if index == *selected || response.hovered() {
                             ui.painter().rect_stroke(
                                 rect,
-                                egui::CornerRadius::same(4),
-                                egui::Stroke::new(if index == *selected { 3.0_f32 } else { 1.5 }, ACCENT),
+                                egui::CornerRadius::same(6),
+                                egui::Stroke::new(if index == *selected { 2.5_f32 } else { 1.5 }, theme::ACCENT_BRIGHT),
                                 egui::StrokeKind::Inside,
                             );
                         }

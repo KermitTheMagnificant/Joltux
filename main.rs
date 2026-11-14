@@ -15,6 +15,7 @@ mod paths;
 mod runtime;
 mod select;
 mod store;
+mod theme;
 
 use std::fs;
 use std::io::{self, Write};

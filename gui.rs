@@ -23,6 +23,19 @@ enum Page {
     Settings,
 }
 
+/// The app icon, embedded so the window has it even when not installed.
+fn window_icon() -> egui::IconData {
+    let png = include_bytes!("assets/joltux-icon-256.png");
+    match image::load_from_memory_with_format(png, image::ImageFormat::Png) {
+        Ok(image) => {
+            let image = image.into_rgba8();
+            let (width, height) = image.dimensions();
+            egui::IconData { rgba: image.into_raw(), width, height }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 /// Messages from a background task to the GUI.
 enum TaskMessage {
     /// Everything the task has printed so far.
@@ -34,6 +47,9 @@ enum TaskMessage {
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Matches the installed joltux.desktop, so Wayland desktops pick up its icon.
+            .with_app_id("joltux")
+            .with_icon(window_icon())
             .with_inner_size([900.0, 650.0])
             .with_min_inner_size([650.0, 480.0]),
         ..Default::default()
@@ -625,7 +641,13 @@ fn collapse_carriage_returns(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{collapse_carriage_returns, progress_fraction};
+    use super::{collapse_carriage_returns, progress_fraction, window_icon};
+
+    #[test]
+    fn embedded_icon_decodes() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+    }
 
     #[test]
     fn reads_download_percentage() {

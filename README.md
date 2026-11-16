@@ -1,9 +1,16 @@
+<p align="center">
+  <img src="assets/joltux-logo.svg" alt="Joltux" width="420">
+</p>
+
 # Joltux: unofficial Game Jolt launcher for Linux
 # AI WARNING: 
-## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass!)
+## This entire app was coded w/ Claude and GitHub Copilot, it was made more for personal use, to be honest (the official one sucks ass)
 Downloads games from Game Jolt and runs them from one place. Prefers native
 Linux builds; falls back to Windows builds run through Proton (via
 [umu-launcher](https://github.com/Open-Wine-Components/umu-launcher)) or Wine.
+The desktop app opens to a searchable Store, where you can review a game's
+available builds without entering its ID. The Library lists locally installed
+games; Game Jolt account-library sync and social features are not implemented.
 
 ```
 joltux info    <game id | url>        # list available builds, shows which would install
@@ -13,10 +20,17 @@ joltux install <id> --build 987654    # pick an exact build listed by `joltux in
 joltux list                           # installed games
 joltux run     <game id>              # launch (native, or through Proton/Wine)
 joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
+joltux login                          # sign in to Game Jolt
+joltux logout                         # remove the saved login
+joltux update                         # install the latest version from GitHub
+joltux setup                          # install Wine + umu-launcher and configure Proton
+joltux gui                            # open the desktop launcher
 joltux config show
 joltux config set runner umu|wine
+joltux config set umu_path /path/to/umu-run
+joltux config set wine_path /path/to/wine
 joltux config set proton_path GE-Proton        # or a path to a Proton folder
-joltux config set session_cookie               # only needed for account-only games; prompts for the value
+joltux config set session_cookie               # paste a browser `frontend` cookie at a hidden prompt
 ```
 
 A game's ID is the number at the end of its URL:
@@ -34,9 +48,9 @@ Open a terminal in the Joltux project directory and run:
 ./install.sh
 ```
 
-The script builds Joltux and installs the `joltux` command in Cargo's bin
-directory (usually `~/.cargo/bin`). It does not need `sudo`. Check the
-installation with:
+The script builds Joltux, installs the `joltux` command in Cargo's bin
+directory (usually `~/.cargo/bin`), and adds a Joltux shortcut to your desktop
+application menu. It does not need `sudo`. Check the installation with:
 
 ```
 joltux --help
@@ -44,8 +58,11 @@ joltux --help
 
 If the shell says `joltux` was not found, add `~/.cargo/bin` to your `PATH`
 and open a new terminal. To install directly without the script, run
-`cargo install --path . --locked` from the project directory. To uninstall,
-run `cargo uninstall joltux`. Run `cargo test` to execute the tests.
+`cargo install --path . --locked` from the project directory; this does not add
+the application-menu shortcut. To uninstall, run `cargo uninstall joltux` and
+remove `joltux.desktop` from `$XDG_DATA_HOME/applications` (or
+`~/.local/share/applications` when `XDG_DATA_HOME` is unset). Run `cargo test`
+to execute the tests.
 
 ## Run a game
 
@@ -56,24 +73,44 @@ joltux info 123456
 joltux install 123456
 joltux list
 joltux run 123456
+joltux gui
 ```
+
+Use `joltux login` to sign in. The password is entered without being echoed
+and is not saved; Joltux stores only the Game Jolt session cookie in its
+owner-only config file. If Game Jolt requires a CAPTCHA, sign in through your
+browser and paste its `frontend` session cookie when prompted. Use
+`joltux logout` to clear the saved session.
+
+Run `joltux update` to rebuild and replace the installed Joltux binary from the
+GitHub repository's default branch. This requires Cargo and internet access;
+it does not update a local source checkout.
 
 Native Linux games need no additional runner. Windows games use `umu-run` by
 default, so install umu-launcher and make sure `umu-run` is on your `PATH`.
 Alternatively, install Wine and select it with `joltux config set runner wine`.
+
+Run `joltux setup` to install the latest official umu-launcher into Joltux's
+user data directory, install Wine from a supported system package manager, and
+configure `GE-Proton` as the UMU runner. UMU downloads GE-Proton the first time
+you launch a Windows game. Setup supports Debian/Ubuntu (`apt`), Fedora/RHEL
+(`dnf`), Arch (`pacman`), and openSUSE (`zypper`); Wine installation may ask for
+administrator authentication. Python 3 with `venv` support is required for the
+user-local umu installation.
 
 ## Status: what is and isn't verified
 
 Verified here (unit tests + smoke tests with fake games):
 build selection, ID parsing, zip/tar.gz extraction (keeps the exec bit, blocks
 path traversal), executable lookup, library/config files, native launch, and
-the umu-run environment/arguments for Windows launches.
+the umu-run environment/arguments for Windows launches. Public game search was
+also checked against a live Game Jolt response on 2026-11-09.
 
-**NOT verified against the live Game Jolt service.** The sandbox this was
-written in could not reach gamejolt.com. The endpoints and response shapes in
-[`src/api.rs`](src/api.rs) / [`src/models.rs`](src/models.rs) were taken from the official client's source
-(github.com/gamejolt/gamejolt, MIT) and may be wrong or have changed:
+The remaining endpoints and response shapes below were taken from the official
+client's source (github.com/gamejolt/gamejolt, MIT) and are not verified against
+the live service:
 
+- `GET /web/search/games?q=...` (public game search; response shape checked live)
 - `GET  /web/discover/games/:id` (title)
 - `GET  /web/discover/games/packages/:id` (packages, releases, builds, launchOptions)
 - `POST /web/discover/games/builds/get-download-url/:buildId` (JSON body
@@ -86,33 +123,33 @@ that uses it.
 
 ## Known gaps
 
-- **Login.** The site's login uses captchas and login-approval flows, so Joltux
-  doesn't do username/password login. Public free games work anonymously; for
-  anything account-linked, copy the `frontend` cookie from a logged-in browser
-  session and paste it when `joltux config set session_cookie` prompts
-  for it (or pipe it in). Leaving the value off the command line keeps it out
-  of your shell history. The config file is only readable by your user. A proper OAuth-style login
-  is future work.
-- **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
-  You install by game ID/URL.
-- **Archive formats:** only .zip and .tar.gz. 7z and others are rejected with
-  a clear error.
-- **No updates / no resume** of interrupted downloads. A failed reinstall
-  does leave the previous install working: new files are extracted to a
-  temporary folder and only swapped in once the executable is found.
+- **CAPTCHA login.** Joltux supports username/password login and device approval,
+  but CAPTCHA challenges must be completed in a browser before pasting the
+  browser's `frontend` cookie into Joltux.
+- **No account-library sync or social features.** The Library currently lists
+  local installs; Store search is public, but account-owned games, profiles,
+  feeds, friends, achievements, and messaging are not connected.
+- **Build formats:** .zip and .tar.gz archives, plus standalone Windows .exe
+  files. Installer builds are not installable.
+- **No game updates / no resume** of interrupted downloads. A failed
+  reinstall does leave the previous install working: new files go to a
+  temporary folder and are only swapped in once the executable is found.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
 - **Symlinks inside zips** are written as plain files.
-- No GUI. It is CLI-only; the modules are split so a GUI can sit on top.
 
 ## Layout
 
+Sources live in `src/`; icons in `assets/`.
+
 ```
 main.rs     CLI (clap) and the install/run/list/uninstall commands
+gui.rs      desktop client UI for Store search, local library, installation, account, and settings
 api.rs      Game Jolt site API client
 models.rs   serde types for API responses + the installed-game record
-select.rs   which build to install (native Linux first, then Windows)
-install.rs  download, extract, locate the executable
+select.rs   which build to install (native Linux first, then Windows; --package/--build)
+install.rs  download, extract, locate the executable, swap new installs into place
 launch.rs   run natively or through umu-run / wine
+runtime.rs  install umu-launcher and system Wine; configure GE-Proton
 config.rs   settings (runner, proton path, session cookie)
 library.rs  installed-games list
 paths.rs    XDG locations (~/.config/joltux, ~/.local/share/joltux)

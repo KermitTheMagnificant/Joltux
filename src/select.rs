@@ -2,8 +2,8 @@
 //!
 //! Policy: prefer a native Linux build (fast, no compatibility layer). Fall
 //! back to a Windows build that will run through Proton/Wine. Browser builds,
-//! installers, removed builds, hidden/removed releases and macOS-only builds
-//! are never chosen.
+//! non-executable raw files, installers, removed builds, hidden/removed
+//! releases and macOS-only builds are never chosen.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -66,15 +66,35 @@ fn classify(build: &Build, windows_only: bool) -> Option<(Platform, u8)> {
     None
 }
 
+pub fn is_standalone_windows_executable(build: &Build) -> bool {
+    (build.os_windows || build.os_windows_64)
+        && build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.filename.as_deref())
+            .is_some_and(|filename| filename.to_ascii_lowercase().ends_with(".exe"))
+}
+
 /// Every installable build that passes `filter`, best first.
 pub fn candidates<'a>(payload: &'a PackagePayload, filter: &Filter) -> Vec<Choice<'a>> {
     let mut out: Vec<Choice<'a>> = payload
         .builds
         .iter()
-        .filter(|b| b.is_downloadable() && b.is_active() && !b.is_installer)
         .filter(|b| filter.build_id.is_none_or(|id| b.id == id))
         .filter(|b| filter.package_id.is_none_or(|id| b.game_package_id == id))
         .filter_map(|build| {
+            if !build.is_downloadable() || !build.is_active() || build.is_installer {
+                return None;
+            }
+            let (platform, rank) = classify(build, filter.windows_only)?;
+            let is_standalone_exe = platform == Platform::Windows
+                && build.primary_file.as_ref().and_then(|file| file.is_archive) == Some(false)
+                && is_standalone_windows_executable(build);
+            if build.primary_file.as_ref().and_then(|file| file.is_archive) == Some(false)
+                && !is_standalone_exe
+            {
+                return None;
+            }
             let release = payload
                 .releases
                 .iter()
@@ -82,11 +102,7 @@ pub fn candidates<'a>(payload: &'a PackagePayload, filter: &Filter) -> Vec<Choic
             if release.is_some_and(|r| !r.is_published()) {
                 return None;
             }
-            let (platform, rank) = classify(build, filter.windows_only)?;
-            let package = payload
-                .packages
-                .iter()
-                .find(|p| p.id == build.game_package_id);
+            let package = payload.packages.iter().find(|p| p.id == build.game_package_id);
             Some(Choice {
                 build,
                 release,
@@ -115,11 +131,7 @@ pub fn find_package<'a>(payload: &'a PackagePayload, query: &str) -> Result<&'a 
             return Ok(p);
         }
     }
-    if let Some(p) = payload
-        .packages
-        .iter()
-        .find(|p| p.display_title().to_lowercase() == q)
-    {
+    if let Some(p) = payload.packages.iter().find(|p| p.display_title().to_lowercase() == q) {
         return Ok(p);
     }
     let partial: Vec<&Package> = payload
@@ -138,10 +150,7 @@ pub fn find_package<'a>(payload: &'a PackagePayload, query: &str) -> Result<&'a 
     match partial.as_slice() {
         [one] => Ok(one),
         [] => bail!("no package matches `{query}`; available: {}", names()),
-        _ => bail!(
-            "`{query}` matches several packages; be more specific. Available: {}",
-            names()
-        ),
+        _ => bail!("`{query}` matches several packages; be more specific. Available: {}", names()),
     }
 }
 
@@ -189,7 +198,10 @@ mod tests {
                  "status": "active"},
                 {"id": 103, "game_package_id": 1, "game_release_id": 10, "type": "downloadable",
                  "status": "removed", "os_linux_64": true},
-                {"id": 104, "game_package_id": 1, "game_release_id": 11, "type": "downloadable",
+                {"id": 104, "game_package_id": 1, "game_release_id": 10, "type": "downloadable",
+                 "status": "active", "os_windows_64": true,
+                 "primary_file": {"filename": "game.bin", "is_archive": false}},
+                {"id": 105, "game_package_id": 1, "game_release_id": 11, "type": "downloadable",
                  "status": "active", "os_linux_64": true},
                 {"id": 200, "game_package_id": 2, "game_release_id": 20, "type": "downloadable",
                  "status": "active", "os_windows": true}
@@ -214,14 +226,7 @@ mod tests {
     #[test]
     fn windows_only_skips_linux() {
         let p = sample();
-        let c = choose(
-            &p,
-            &Filter {
-                windows_only: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let c = choose(&p, &Filter { windows_only: true, ..Default::default() }).unwrap();
         assert_eq!(c.build.id, 100);
         assert_eq!(c.platform, Platform::Windows);
     }
@@ -229,11 +234,9 @@ mod tests {
     #[test]
     fn skips_html_and_removed_builds() {
         let p = sample();
-        let ids: Vec<u64> = candidates(&p, &Filter::default())
-            .iter()
-            .map(|c| c.build.id)
-            .collect();
-        // 104 belongs to a hidden release, 102 is html, 103 is removed.
+        let ids: Vec<u64> = candidates(&p, &Filter::default()).iter().map(|c| c.build.id).collect();
+        // 102 is html, 103 is removed, 104 is a raw non-exe file,
+        // 105 belongs to a hidden release.
         assert_eq!(ids, vec![101, 100, 200]);
     }
 
@@ -242,34 +245,13 @@ mod tests {
         let p = sample();
         let demo = find_package(&p, "demo").unwrap();
         assert_eq!(demo.id, 2);
-        let c = choose(
-            &p,
-            &Filter {
-                package_id: Some(demo.id),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let c = choose(&p, &Filter { package_id: Some(demo.id), ..Default::default() }).unwrap();
         assert_eq!(c.build.id, 200);
         assert_eq!(c.package_title(), "Demo");
 
-        let c = choose(
-            &p,
-            &Filter {
-                build_id: Some(100),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let c = choose(&p, &Filter { build_id: Some(100), ..Default::default() }).unwrap();
         assert_eq!(c.build.id, 100);
-        assert!(choose(
-            &p,
-            &Filter {
-                build_id: Some(104),
-                ..Default::default()
-            }
-        )
-        .is_none());
+        assert!(choose(&p, &Filter { build_id: Some(105), ..Default::default() }).is_none());
     }
 
     #[test]
@@ -289,4 +271,27 @@ mod tests {
         assert_eq!(lo.executable_path, "Game.exe");
         assert!(launch_option(&p.launch_options, 100, Platform::Linux).is_none());
     }
+
+        #[test]
+        fn accepts_standalone_windows_executable_without_launch_path() {
+                let payload: PackagePayload = serde_json::from_str(
+                        r#"{
+                            "builds": [{
+                                "id": 731959, "type": "downloadable", "status": "active",
+                                "os_windows": true, "os_windows_64": true, "is_installer": false,
+                                "primary_file": {
+                                    "filename": "five-nights-at-candy-s-remastered.exe",
+                                    "is_archive": false
+                                }
+                            }],
+                            "launchOptions": [{"game_build_id": 731959, "os": null, "executable_path": null}]
+                        }"#,
+                )
+                .unwrap();
+
+                let choice = choose(&payload, &Filter::default()).unwrap();
+                assert_eq!(choice.build.id, 731959);
+                assert_eq!(choice.platform, Platform::Windows);
+                assert!(is_standalone_windows_executable(choice.build));
+        }
 }

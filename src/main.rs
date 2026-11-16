@@ -4,22 +4,28 @@
 //! Windows builds through Proton (via umu-launcher) or Wine.
 
 mod api;
+mod checks;
 mod config;
+mod gui;
 mod install;
 mod launch;
 mod library;
 mod models;
 mod paths;
+mod runtime;
 mod select;
+mod store;
+mod theme;
 
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::api::ApiClient;
+use crate::api::{ApiClient, LoginOutcome};
 use crate::config::Config;
 use crate::library::Library;
 use crate::models::InstalledGame;
@@ -27,11 +33,7 @@ use crate::paths::Paths;
 use crate::select::{Filter, Platform};
 
 #[derive(Parser)]
-#[command(
-    name = "joltux",
-    version,
-    about = "Unofficial Game Jolt launcher for Linux"
-)]
+#[command(name = "joltux", version, about = "Unofficial Game Jolt launcher for Linux")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -65,6 +67,20 @@ enum Command {
     },
     /// List installed games
     List,
+    /// Log in to Game Jolt
+    Login,
+    /// Log out of Game Jolt
+    Logout,
+    /// Update Joltux from its GitHub repository
+    Update {
+        /// Rebuild even if the installed commit already matches GitHub
+        #[arg(long)]
+        force: bool,
+    },
+    /// Install Wine and umu-launcher, then configure Proton
+    Setup,
+    /// Open the desktop launcher
+    Gui,
     /// Remove an installed game (and, with --prefix, its Wine prefix)
     Uninstall {
         game_id: u64,
@@ -83,8 +99,8 @@ enum Command {
 enum ConfigAction {
     /// Print current settings
     Show,
-    /// Set a value: runner (umu|wine), proton_path, session_cookie.
-    /// Leave out the value for session_cookie to paste it at a prompt
+    /// Set a value: runner (umu|wine), umu_path, wine_path, proton_path, session_cookie.
+    /// Leave out the value for session_cookie to paste it at a hidden prompt
     /// (or pipe it in) so it doesn't end up in your shell history.
     Set { key: String, value: Option<String> },
 }
@@ -111,6 +127,11 @@ fn run() -> Result<()> {
         } => cmd_install(&paths, &game, windows, package.as_deref(), build),
         Command::Run { game_id } => cmd_run(&paths, game_id),
         Command::List => cmd_list(&paths),
+        Command::Login => cmd_login(&paths),
+        Command::Logout => cmd_logout(&paths),
+        Command::Update { force } => cmd_update(force),
+        Command::Setup => cmd_setup(&paths),
+        Command::Gui => gui::run(),
         Command::Uninstall { game_id, prefix } => cmd_uninstall(&paths, game_id, prefix),
         Command::Config { action } => cmd_config(&paths, action),
     }
@@ -145,7 +166,7 @@ fn cmd_info(paths: &Paths, game: &str) -> Result<()> {
 
     let candidates = select::candidates(&payload, &Filter::default());
     if candidates.is_empty() {
-        println!("  no installable Linux or Windows builds found (web-only, macOS-only, or paid/unowned)");
+        println!("  no installable Linux or Windows builds found (web-only, macOS-only, paid/unowned, installers, or unsupported raw files)");
         return Ok(());
     }
     for (i, c) in candidates.iter().enumerate() {
@@ -196,12 +217,14 @@ fn cmd_install(
         if let Some(b) = build {
             bail!("build {b} is not an installable Linux or Windows build of {title} (see `joltux info {id}`)");
         }
-        bail!("{title} has no installable Linux or Windows build matching your options");
+        if package_id.is_some() {
+            bail!("that package of {title} has no installable Linux or Windows build (see `joltux info {id}`)");
+        }
+        bail!(
+            "{title} has no installable Linux or Windows build (Joltux supports .zip and .tar.gz archives, plus standalone Windows .exe files; installers are not supported)"
+        );
     };
-    let version = choice
-        .release
-        .map(|r| r.version_number.clone())
-        .unwrap_or_default();
+    let version = choice.release.map(|r| r.version_number.clone()).unwrap_or_default();
     println!(
         "Installing {title} [{}]: build {} ({})",
         choice.package_title(),
@@ -211,17 +234,15 @@ fn cmd_install(
 
     // Games with e.g. a demo and a full version: say what else exists.
     if package_id.is_none() && build.is_none() {
-        let mut others: Vec<String> = select::candidates(
-            &payload,
-            &Filter {
-                windows_only,
-                ..Default::default()
-            },
-        )
-        .iter()
-        .filter(|c| c.build.game_package_id != choice.build.game_package_id)
-        .map(|c| format!("\"{}\"", c.package_title()))
-        .collect();
+        let any_package = Filter {
+            windows_only,
+            ..Default::default()
+        };
+        let mut others: Vec<String> = select::candidates(&payload, &any_package)
+            .iter()
+            .filter(|c| c.build.game_package_id != choice.build.game_package_id)
+            .map(|c| format!("\"{}\"", c.package_title()))
+            .collect();
         others.sort();
         others.dedup();
         if !others.is_empty() {
@@ -232,40 +253,56 @@ fn cmd_install(
         }
     }
 
-    // Work out what to launch before downloading, so we fail early if the
-    // game has no launch information.
-    let Some(option) =
+    let standalone_exe = choice.platform == Platform::Windows
+        && choice
+            .build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.is_archive)
+            == Some(false)
+        && select::is_standalone_windows_executable(choice.build);
+    let executable_path = if standalone_exe {
+        choice
+            .build
+            .primary_file
+            .as_ref()
+            .and_then(|file| file.filename.clone())
+            .context("standalone Windows build has no filename")?
+    } else {
         select::launch_option(&payload.launch_options, choice.build.id, choice.platform)
-    else {
-        bail!(
-            "build {} has no launch option for this platform",
-            choice.build.id
-        );
+            .map(|option| option.executable_path.clone())
+            .filter(|path| !path.is_empty())
+            .with_context(|| {
+                format!(
+                    "build {} has no launch path for this platform",
+                    choice.build.id
+                )
+            })?
     };
 
     let url = api.download_url(choice.build.id)?;
-    let archive = paths
-        .downloads_dir
-        .join(format!("{}.archive", choice.build.id));
+    let archive = paths.downloads_dir.join(format!("{}.archive", choice.build.id));
     install::download(&url, &archive)?;
 
-    // Extract next to the real folder and only swap it in once it's known to
+    // Unpack next to the real folder and only swap it in once it's known to
     // be good, so a failed reinstall never breaks a working install.
     let dir = paths.game_dir(id);
     let staging = install::sibling(&dir, "new");
     if staging.exists() {
         fs::remove_dir_all(&staging).context("could not clear a leftover partial install")?;
     }
-    println!("Extracting...");
     let prepared = (|| -> Result<PathBuf> {
-        install::extract(&archive, &staging, &choice.build.archive_type)?;
-        let exe =
-            install::find_executable(&staging, &option.executable_path).with_context(|| {
-                format!("could not find `{}` in the archive", option.executable_path)
-            })?;
+        let exe = if standalone_exe {
+            install::install_raw_executable(&archive, &staging, &executable_path)?
+        } else {
+            println!("Extracting...");
+            install::extract(&archive, &staging, &choice.build.archive_type)?;
+            install::find_executable(&staging, &executable_path)
+                .with_context(|| format!("could not find `{executable_path}` in the archive"))?
+        };
         Ok(exe.strip_prefix(&staging)?.to_path_buf())
     })();
-    let _ = fs::remove_file(&archive); // the archive is no longer needed either way
+    let _ = fs::remove_file(&archive); // the download is no longer needed either way
     let relative_exe = match prepared {
         Ok(rel) => rel,
         Err(e) => {
@@ -274,6 +311,7 @@ fn cmd_install(
         }
     };
     install::swap_into_place(&staging, &dir)?;
+    let executable = dir.join(relative_exe);
 
     let mut library = Library::load(paths)?;
     library.upsert(InstalledGame {
@@ -282,8 +320,8 @@ fn cmd_install(
         build_id: choice.build.id,
         platform: choice.platform,
         version,
-        executable: dir.join(relative_exe),
         install_dir: dir,
+        executable,
     });
     library.save(paths)?;
     println!("Done. Play with: joltux run {id}");
@@ -307,6 +345,148 @@ fn cmd_list(paths: &Paths) -> Result<()> {
     for g in &library.games {
         println!("{:>8}  {}  [{}]", g.game_id, g.title, describe(g.platform));
     }
+    Ok(())
+}
+
+fn cmd_login(paths: &Paths) -> Result<()> {
+    let mut username = String::new();
+    print!("Game Jolt username: ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut username)?;
+    let username = username.trim();
+    if username.is_empty() {
+        bail!("username cannot be empty");
+    }
+    let password = rpassword::prompt_password("Password: ").context("could not read password")?;
+    let api = ApiClient::new(None)?;
+
+    let cookie = match api.login(username, &password)? {
+        LoginOutcome::Authenticated(cookie) => cookie,
+        LoginOutcome::CaptchaRequired => {
+            println!("Game Jolt requires a CAPTCHA. Sign in through your browser, then copy its frontend session cookie here.");
+            let cookie = rpassword::prompt_password("frontend cookie: ")
+                .context("could not read frontend cookie")?;
+            if cookie.is_empty() {
+                bail!("frontend cookie cannot be empty");
+            }
+            cookie
+        }
+        LoginOutcome::ApprovalRequired(token) => {
+            println!("Approve this login using the link Game Jolt emailed you. Waiting up to 10 minutes...");
+            api.poll_login_approval(&token)?
+        }
+    };
+
+    let mut config = Config::load(paths)?;
+    config.session_cookie = Some(cookie);
+    config.save(paths)?;
+    println!("Logged in to Game Jolt.");
+    Ok(())
+}
+
+fn cmd_logout(paths: &Paths) -> Result<()> {
+    let mut config = Config::load(paths)?;
+    config.session_cookie = None;
+    config.save(paths)?;
+    println!("Logged out of Game Jolt.");
+    Ok(())
+}
+
+const REPO_URL: &str = "https://github.com/KermitTheMagnificant/Joltux.git";
+const LATEST_COMMIT_API: &str =
+    "https://api.github.com/repos/KermitTheMagnificant/Joltux/commits/main";
+
+fn cmd_update(force: bool) -> Result<()> {
+    if !force {
+        match (installed_commit(), latest_commit()) {
+            (Some(installed), Ok(latest)) if installed == latest => {
+                println!("Joltux is already up to date (commit {}).", short_sha(&latest));
+                return Ok(());
+            }
+            (Some(installed), Ok(latest)) => {
+                println!(
+                    "Update available: {} -> {}.",
+                    short_sha(&installed),
+                    short_sha(&latest)
+                );
+            }
+            (None, Ok(latest)) => {
+                println!(
+                    "Can't tell which commit is installed (it was probably installed from a local copy). \
+                     Installing the latest commit, {}.",
+                    short_sha(&latest)
+                );
+            }
+            (_, Err(err)) => {
+                println!("Couldn't check GitHub for the latest version ({err:#}). Updating anyway.");
+            }
+        }
+    }
+
+    println!("Updating Joltux from GitHub...");
+    let status = ProcessCommand::new("cargo")
+        .args(["install", "--git", REPO_URL, "--locked", "--force", "--bin", "joltux"])
+        .status()
+        .context("could not start Cargo; install Rust and Cargo to update Joltux")?;
+    if !status.success() {
+        bail!("Joltux update failed (Cargo exited with {status})");
+    }
+    println!("Joltux updated.");
+    Ok(())
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// The commit `cargo install --git` recorded for Joltux, if it was installed that way.
+fn installed_commit() -> Option<String> {
+    let cargo_root = std::env::var_os("CARGO_INSTALL_ROOT")
+        .or_else(|| std::env::var_os("CARGO_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|d| d.home_dir().join(".cargo")))?;
+    let text = fs::read_to_string(cargo_root.join(".crates2.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    commit_from_crates2(&json)
+}
+
+/// Finds the Joltux entry, keyed like `joltux 0.1.0 (git+https://...Joltux.git#<sha>)`.
+fn commit_from_crates2(json: &serde_json::Value) -> Option<String> {
+    let repo = REPO_URL.trim_end_matches(".git").to_ascii_lowercase();
+    json.get("installs")?.as_object()?.keys().find_map(|key| {
+        let source = key.strip_prefix("joltux ")?.split_once(" (git+")?.1.strip_suffix(')')?;
+        let (url, sha) = source.rsplit_once('#')?;
+        let url = url.split('?').next()?.trim_end_matches(".git").to_ascii_lowercase();
+        (url == repo).then(|| sha.to_owned())
+    })
+}
+
+/// The latest commit on `main` according to the GitHub API.
+fn latest_commit() -> Result<String> {
+    let resp = reqwest::blocking::Client::builder()
+        .user_agent(api::USER_AGENT)
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .context("failed to build HTTP client")?
+        .get(LATEST_COMMIT_API)
+        .header("Accept", "application/vnd.github.sha")
+        .send()
+        .context("could not reach GitHub")?;
+    let status = resp.status();
+    if !status.is_success() {
+        bail!("GitHub returned HTTP {status}");
+    }
+    let sha = resp.text().context("could not read GitHub's response")?.trim().to_owned();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("GitHub returned an unexpected response");
+    }
+    Ok(sha)
+}
+
+fn cmd_setup(paths: &Paths) -> Result<()> {
+    let mut config = Config::load(paths)?;
+    runtime::setup(paths, &mut config)?;
+    println!("Runtime setup complete. Windows games will use umu with GE-Proton.");
     Ok(())
 }
 
@@ -336,9 +516,7 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
         ConfigAction::Set { key, value } => {
             let value = match value {
                 Some(v) if v != "-" => v,
-                _ if key == "session_cookie" => {
-                    read_secret("Paste the `frontend` cookie value and press Enter: ")?
-                }
+                _ if key == "session_cookie" => read_secret("frontend cookie: ")?,
                 _ => bail!("missing value for `{key}`"),
             };
             config.set(&key, &value)?;
@@ -349,14 +527,14 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
     Ok(())
 }
 
-/// Reads one line from stdin, prompting only when stdin is a terminal.
-/// Note: the terminal still echoes what you paste; the point is keeping the
-/// value out of shell history and the process list.
+/// Reads a secret without echoing it when run in a terminal, or one line
+/// from stdin when it's piped in.
 fn read_secret(prompt: &str) -> Result<String> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
-        eprint!("{prompt}");
-        io::stderr().flush()?;
+        return rpassword::prompt_password(prompt)
+            .map(|s| s.trim().to_string())
+            .context("could not read from the terminal");
     }
     let mut line = String::new();
     stdin
@@ -368,23 +546,28 @@ fn read_secret(prompt: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_game_id;
+    use super::{commit_from_crates2, parse_game_id};
 
     #[test]
     fn parses_ids_and_urls() {
         assert_eq!(parse_game_id("12345").unwrap(), 12345);
-        assert_eq!(
-            parse_game_id("https://gamejolt.com/games/cool-game/12345").unwrap(),
-            12345
-        );
-        assert_eq!(
-            parse_game_id("https://gamejolt.com/games/cool-game/12345/").unwrap(),
-            12345
-        );
-        assert_eq!(
-            parse_game_id("https://gamejolt.com/games/cool-game/12345?ref=x#top").unwrap(),
-            12345
-        );
+        assert_eq!(parse_game_id("https://gamejolt.com/games/cool-game/12345").unwrap(), 12345);
+        assert_eq!(parse_game_id("https://gamejolt.com/games/cool-game/12345/").unwrap(), 12345);
+        assert_eq!(parse_game_id("https://gamejolt.com/games/cool-game/12345?ref=x#top").unwrap(), 12345);
         assert!(parse_game_id("https://gamejolt.com/games/cool-game").is_err());
+    }
+
+    #[test]
+    fn finds_installed_commit_in_crates2() {
+        let json = serde_json::json!({"installs": {
+            "rls 0.1.0 (git+https://github.com/KermitTheMagnificant/GRNU.git#aaaa)": {},
+            "joltux 0.1.0 (git+https://github.com/KermitTheMagnificant/Joltux.git#bbbb)": {}
+        }});
+        assert_eq!(commit_from_crates2(&json).as_deref(), Some("bbbb"));
+
+        let path_install = serde_json::json!({"installs": {
+            "joltux 0.1.0 (path+file:///home/me/Joltux)": {}
+        }});
+        assert_eq!(commit_from_crates2(&path_install), None);
     }
 }

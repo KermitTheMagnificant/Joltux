@@ -12,12 +12,12 @@ pub struct Paths {
     pub games_dir: PathBuf,
     pub downloads_dir: PathBuf,
     pub prefixes_dir: PathBuf,
+    pub runtimes_dir: PathBuf,
 }
 
 impl Paths {
     pub fn discover() -> Result<Self> {
-        let dirs =
-            ProjectDirs::from("", "", "joltux").context("could not determine home directory")?;
+        let dirs = ProjectDirs::from("", "", "joltux").context("could not determine home directory")?;
         let data = dirs.data_dir();
         Ok(Self {
             config_file: dirs.config_dir().join("config.json"),
@@ -25,6 +25,7 @@ impl Paths {
             games_dir: data.join("games"),
             downloads_dir: data.join("downloads"),
             prefixes_dir: data.join("prefixes"),
+            runtimes_dir: data.join("runtimes"),
         })
     }
 
@@ -37,6 +38,7 @@ impl Paths {
             games_dir: root.join("games"),
             downloads_dir: root.join("downloads"),
             prefixes_dir: root.join("prefixes"),
+            runtimes_dir: root.join("runtimes"),
         }
     }
 

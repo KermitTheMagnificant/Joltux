@@ -8,20 +8,23 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, SET_COOKIE};
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
-use crate::models::PackagePayload;
+use crate::models::{GameDetails, GameInfo, GameMedia, GameSearchPayload, PackagePayload};
 
-pub const USER_AGENT: &str = concat!(
-    "Joltux/",
-    env!("CARGO_PKG_VERSION"),
-    " (unofficial Linux launcher)"
-);
+pub const USER_AGENT: &str = concat!("Joltux/", env!("CARGO_PKG_VERSION"), " (unofficial Linux launcher)");
 const BASE: &str = "https://gamejolt.com/site-api";
 
 pub struct ApiClient {
     http: Client,
+}
+
+pub enum LoginOutcome {
+    Authenticated(String),
+    CaptchaRequired,
+    ApprovalRequired(String),
 }
 
 impl ApiClient {
@@ -49,22 +52,26 @@ impl ApiClient {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        let url = format!("{BASE}{path}");
+        let url =
+            reqwest::Url::parse(&format!("{BASE}{path}")).context("invalid Game Jolt API URL")?;
+        self.get_url(url)
+    }
+
+    fn get_url(&self, url: reqwest::Url) -> Result<Value> {
+        let url_text = url.to_string();
         let resp = self
             .http
-            .get(&url)
+            .get(url)
             .send()
-            .with_context(|| format!("GET {url} failed"))?;
+            .with_context(|| format!("GET {url_text} failed"))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             bail!("not logged in (401). Set your session cookie: joltux config set session_cookie <value>");
         }
         if !status.is_success() {
-            bail!("GET {url} returned HTTP {status}");
+            bail!("GET {url_text} returned HTTP {status}");
         }
-        Ok(Self::unwrap_payload(
-            resp.json().context("response was not JSON")?,
-        ))
+        Ok(Self::unwrap_payload(resp.json().context("response was not JSON")?))
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
@@ -76,12 +83,92 @@ impl ApiClient {
             .send()
             .with_context(|| format!("POST {url} failed"))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("not logged in (401). Run `joltux login` to sign in");
+        }
         if !status.is_success() {
             bail!("POST {url} returned HTTP {status}");
         }
-        Ok(Self::unwrap_payload(
-            resp.json().context("response was not JSON")?,
-        ))
+        Ok(Self::unwrap_payload(resp.json().context("response was not JSON")?))
+    }
+
+    /// Starts a Game Jolt login and returns the session cookie on success.
+    pub fn login(&self, username: &str, password: &str) -> Result<LoginOutcome> {
+        let url = format!("{BASE}/web/auth/login");
+        let resp = self
+            .http
+            .post(&url)
+            .json(&json!({ "username": username, "password": password }))
+            .send()
+            .context("login request failed")?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("login endpoint returned HTTP {status}");
+        }
+        let cookie = frontend_cookie(resp.headers());
+        let payload = Self::unwrap_payload(resp.json().context("login response was not JSON")?);
+
+        if payload.get("success").and_then(Value::as_bool) == Some(true) {
+            return cookie
+                .map(LoginOutcome::Authenticated)
+                .context("login succeeded, but Game Jolt did not return a session cookie");
+        }
+        if payload.get("token").and_then(Value::as_str).is_some()
+            || payload.get("reason").and_then(Value::as_str) == Some("captcha")
+        {
+            return Ok(LoginOutcome::CaptchaRequired);
+        }
+        if payload.get("reason").and_then(Value::as_str) == Some("approve-login") {
+            let token = payload
+                .get("loginPollingToken")
+                .and_then(Value::as_str)
+                .context("approval response had no login polling token")?;
+            return Ok(LoginOutcome::ApprovalRequired(token.to_owned()));
+        }
+
+        let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("unknown");
+        let message = match reason {
+            "invalid-login" => "incorrect username or password".to_owned(),
+            "blocked" => "login blocked after too many attempts".to_owned(),
+            "approve-login-rejected" => "device approval was rejected".to_owned(),
+            "try-again" => "Game Jolt could not process the login; try again later".to_owned(),
+            other => format!("Game Jolt rejected the login ({other})"),
+        };
+        bail!("{message}");
+    }
+
+    /// Waits for email approval and returns the session cookie once approved.
+    pub fn poll_login_approval(&self, token: &str) -> Result<String> {
+        if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            bail!("approval token contained unsupported characters");
+        }
+        let url = format!("{BASE}/web/auth/poll-blocked-login/{token}");
+        let deadline = Instant::now() + Duration::from_secs(10 * 60);
+        loop {
+            let resp = self.http.get(&url).send().context("login approval poll failed")?;
+            let status = resp.status();
+            if !status.is_success() {
+                bail!("login approval poll returned HTTP {status}");
+            }
+            let cookie = frontend_cookie(resp.headers());
+            let payload = Self::unwrap_payload(resp.json().context("approval response was not JSON")?);
+            match payload.get("status").and_then(Value::as_str) {
+                Some("complete") => {
+                    return cookie.context("approval completed, but Game Jolt did not return a session cookie");
+                }
+                Some("error") => match payload.get("reason").and_then(Value::as_str) {
+                    Some("expired") => bail!("login approval expired; run `joltux login` again"),
+                    Some("rejected") => bail!("device approval was rejected"),
+                    _ => bail!("Game Jolt could not approve this login"),
+                },
+                Some("progress") => {}
+                _ => bail!("unexpected response while waiting for login approval"),
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out waiting for login approval; run `joltux login` again");
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
     }
 
     /// Game title, if the response has the shape we expect.
@@ -91,6 +178,69 @@ impl ApiClient {
             .pointer("/game/title")
             .and_then(Value::as_str)
             .map(str::to_owned))
+    }
+
+    /// Searches public games using the same route as the Game Jolt website.
+    pub fn search_games(&self, query: &str, page: u32) -> Result<GameSearchPayload> {
+        let mut url = reqwest::Url::parse(&format!("{BASE}/web/search/games"))
+            .context("invalid Game Jolt search URL")?;
+        {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("q", query);
+            if page > 1 {
+                query_pairs.append_pair("page", &page.to_string());
+            }
+        }
+        let payload = self.get_url(url)?;
+        serde_json::from_value(payload).context("unexpected shape for game search payload")
+    }
+
+    /// Browses public games the way the website's game listings do.
+    /// `section` is "hot", "new", "best" or "featured"; `tag` is a category
+    /// such as "horror" (`None` for all games).
+    pub fn browse_games(&self, section: &str, tag: Option<&str>, page: u32) -> Result<GameSearchPayload> {
+        let mut url = reqwest::Url::parse(&format!("{BASE}/web/discover/games"))
+            .context("invalid Game Jolt browse URL")?;
+        {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("section", section);
+            if let Some(tag) = tag {
+                query_pairs.append_pair("tag", tag);
+            }
+            if page > 1 {
+                query_pairs.append_pair("page", &page.to_string());
+            }
+        }
+        let payload = self.get_url(url)?;
+        let mut result: GameSearchPayload =
+            serde_json::from_value(payload).context("unexpected shape for game listing payload")?;
+        // Listings don't echo the page number back.
+        if result.page == 0 {
+            result.page = page.max(1);
+        }
+        Ok(result)
+    }
+
+    /// A game's description, header image, screenshots and videos.
+    pub fn game_details(&self, game_id: u64) -> Result<GameDetails> {
+        let payload = self.get(&format!("/web/discover/games/{game_id}"))?;
+        let game: GameInfo = serde_json::from_value(payload.get("game").cloned().unwrap_or_default())
+            .context("unexpected shape for game payload")?;
+        let overview = self.get(&format!("/web/discover/games/overview/{game_id}"))?;
+        let media = overview
+            .get("mediaItems")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            // Skip individual items we can't read rather than failing the page.
+            .filter_map(|item| serde_json::from_value::<GameMedia>(item.clone()).ok())
+            .collect();
+        let meta_description = overview
+            .get("metaDescription")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Ok(GameDetails { game, media, meta_description })
     }
 
     /// All packages, releases, builds and launch options for a game.
@@ -110,5 +260,50 @@ impl ApiClient {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("download-url response had no `url` field")
+    }
+}
+
+fn frontend_cookie(headers: &HeaderMap) -> Option<String> {
+    headers.get_all(SET_COOKIE).iter().find_map(|header| {
+        let value = header.to_str().ok()?;
+        let (name, value) = value.split_once('=')?;
+        if name != "frontend" {
+            return None;
+        }
+        let value = value.split(';').next()?;
+        (!value.is_empty()).then(|| value.to_owned())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::frontend_cookie;
+    use reqwest::header::{HeaderMap, HeaderValue, SET_COOKIE};
+
+    #[test]
+    fn extracts_frontend_cookie_without_attributes() {
+        let mut headers = HeaderMap::new();
+        headers.append(SET_COOKIE, HeaderValue::from_static("other=x; Path=/"));
+        headers.append(SET_COOKIE, HeaderValue::from_static("frontend=abc123; Path=/; Secure"));
+        assert_eq!(frontend_cookie(&headers).as_deref(), Some("abc123"));
+    }
+
+    /// Hits the live Game Jolt API: `cargo test -- --ignored live_store`.
+    #[test]
+    #[ignore]
+    fn live_store_endpoints() {
+        let api = super::ApiClient::new(None).unwrap();
+        let listing = api.browse_games("hot", Some("horror"), 2).unwrap();
+        assert_eq!(listing.page, 2);
+        assert!(!listing.games.is_empty());
+        let game = &listing.games[0];
+        let details = api.game_details(game.id).unwrap();
+        assert_eq!(details.game.id, game.id);
+        println!(
+            "{} — {} media, {} description blocks",
+            details.game.title,
+            details.media.len(),
+            crate::models::description_blocks(&details.game.description_content).len()
+        );
     }
 }

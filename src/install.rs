@@ -34,16 +34,13 @@ pub fn download(url: &str, dest: &Path) -> Result<u64> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file =
-        File::create(dest).with_context(|| format!("cannot create {}", dest.display()))?;
+    let mut file = File::create(dest).with_context(|| format!("cannot create {}", dest.display()))?;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
     let mut last_report: u64 = 0;
     loop {
-        let n = resp
-            .read(&mut buf)
-            .context("connection dropped mid-download")?;
+        let n = resp.read(&mut buf).context("connection dropped mid-download")?;
         if n == 0 {
             break;
         }
@@ -63,12 +60,7 @@ pub fn download(url: &str, dest: &Path) -> Result<u64> {
 fn print_progress(done: u64, total: Option<u64>) {
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     match total {
-        Some(t) if t > 0 => eprint!(
-            "\r  {:.1} / {:.1} MiB ({}%)   ",
-            mib(done),
-            mib(t),
-            done * 100 / t
-        ),
+        Some(t) if t > 0 => eprint!("\r  {:.1} / {:.1} MiB ({}%)   ", mib(done), mib(t), done * 100 / t),
         _ => eprint!("\r  {:.1} MiB   ", mib(done)),
     }
 }
@@ -104,6 +96,28 @@ pub fn extract(archive: &Path, dest: &Path, archive_type_hint: &str) -> Result<(
     }
 }
 
+pub fn install_raw_executable(download: &Path, dest: &Path, filename: &str) -> Result<PathBuf> {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || !filename.to_ascii_lowercase().ends_with(".exe")
+    {
+        bail!("unsafe standalone executable filename `{filename}`");
+    }
+
+    fs::create_dir_all(dest)?;
+    let executable = dest.join(filename);
+    fs::rename(download, &executable).with_context(|| {
+        format!(
+            "could not move downloaded executable to {}",
+            executable.display()
+        )
+    })?;
+    Ok(executable)
+}
+
 fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(File::open(archive)?).context("not a valid zip file")?;
     for i in 0..zip.len() {
@@ -124,8 +138,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut f =
-            File::create(&out).with_context(|| format!("cannot create {}", out.display()))?;
+        let mut f = File::create(&out).with_context(|| format!("cannot create {}", out.display()))?;
         io::copy(&mut entry, &mut f)?;
 
         // Keep the executable bit: native Linux builds need it.
@@ -242,9 +255,7 @@ pub fn sibling(dir: &Path, suffix: &str) -> PathBuf {
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
+    let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         // file_type() doesn't follow symlinks, so a symlink loop can't trap us.
@@ -329,6 +340,23 @@ mod tests {
     }
 
     #[test]
+    fn installs_standalone_executable_and_rejects_unsafe_names() {
+        let root = scratch("raw-exe");
+        let download = root.join("download.archive");
+        fs::write(&download, b"windows executable").unwrap();
+
+        let executable = install_raw_executable(&download, &root.join("out"), "game.exe").unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), b"windows executable");
+        assert!(!download.exists());
+
+        let download = root.join("another-download.archive");
+        fs::write(&download, b"executable").unwrap();
+        assert!(install_raw_executable(&download, &root.join("out"), "../evil.exe").is_err());
+        assert!(download.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn zip_roundtrip_keeps_exec_bit_and_blocks_traversal() {
         use zip::write::FileOptions;
         let root = scratch("zip");
@@ -349,10 +377,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(out.join("run.sh"))
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = fs::metadata(out.join("run.sh")).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111);
         }
         let _ = fs::remove_dir_all(&root);

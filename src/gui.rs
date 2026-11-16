@@ -56,7 +56,7 @@ const FORM_WIDTH: f32 = 640.0;
 
 /// The app icon, embedded so the window has it even when not installed.
 fn window_icon() -> egui::IconData {
-    let png = include_bytes!("assets/joltux-icon-256.png");
+    let png = include_bytes!("../assets/joltux-icon-256.png");
     match image::load_from_memory_with_format(png, image::ImageFormat::Png) {
         Ok(image) => {
             let image = image.into_rgba8();
@@ -552,7 +552,7 @@ impl JoltuxApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             ui.add(
-                egui::Image::new(egui::include_image!("assets/joltux-icon-256.png"))
+                egui::Image::new(egui::include_image!("../assets/joltux-icon-256.png"))
                     .fit_to_exact_size(egui::vec2(36.0, 36.0)),
             );
             let mut wordmark = egui::text::LayoutJob::default();

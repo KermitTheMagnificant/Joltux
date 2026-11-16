@@ -18,7 +18,8 @@ mod store;
 mod theme;
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
 use anyhow::{bail, Context, Result};
@@ -29,7 +30,7 @@ use crate::config::Config;
 use crate::library::Library;
 use crate::models::InstalledGame;
 use crate::paths::Paths;
-use crate::select::Platform;
+use crate::select::{Filter, Platform};
 
 #[derive(Parser)]
 #[command(name = "joltux", version, about = "Unofficial Game Jolt launcher for Linux")]
@@ -52,6 +53,12 @@ enum Command {
         /// Ignore native Linux builds and install the Windows build
         #[arg(long)]
         windows: bool,
+        /// Install from this package (ID or name, e.g. "demo"); see `joltux info`
+        #[arg(long)]
+        package: Option<String>,
+        /// Install this exact build ID; see `joltux info`
+        #[arg(long)]
+        build: Option<u64>,
     },
     /// Run an installed game
     Run {
@@ -92,8 +99,10 @@ enum Command {
 enum ConfigAction {
     /// Print current settings
     Show,
-    /// Set a value: runner (umu|wine), umu_path, wine_path, proton_path, session_cookie
-    Set { key: String, value: String },
+    /// Set a value: runner (umu|wine), umu_path, wine_path, proton_path, session_cookie.
+    /// Leave out the value for session_cookie to paste it at a hidden prompt
+    /// (or pipe it in) so it doesn't end up in your shell history.
+    Set { key: String, value: Option<String> },
 }
 
 fn main() {
@@ -110,7 +119,12 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Info { game } => cmd_info(&paths, &game),
-        Command::Install { game, windows } => cmd_install(&paths, &game, windows),
+        Command::Install {
+            game,
+            windows,
+            package,
+            build,
+        } => cmd_install(&paths, &game, windows, package.as_deref(), build),
         Command::Run { game_id } => cmd_run(&paths, game_id),
         Command::List => cmd_list(&paths),
         Command::Login => cmd_login(&paths),
@@ -150,7 +164,7 @@ fn cmd_info(paths: &Paths, game: &str) -> Result<()> {
     let payload = api.packages(id)?;
     println!("{title} (id {id})");
 
-    let candidates = select::candidates(&payload, false);
+    let candidates = select::candidates(&payload, &Filter::default());
     if candidates.is_empty() {
         println!("  no installable Linux or Windows builds found (web-only, macOS-only, paid/unowned, installers, or unsupported raw files)");
         return Ok(());
@@ -165,25 +179,79 @@ fn cmd_info(paths: &Paths, game: &str) -> Result<()> {
             .map(|b| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0)))
             .unwrap_or_else(|| "unknown size".into());
         let marker = if i == 0 { "  <- would install" } else { "" };
-        println!("  build {} v{} {} [{}]{}", c.build.id, version, describe(c.platform), size, marker);
+        println!(
+            "  [{}] build {} v{} {} [{}]{}",
+            c.package_title(),
+            c.build.id,
+            version,
+            describe(c.platform),
+            size,
+            marker
+        );
     }
     Ok(())
 }
 
-fn cmd_install(paths: &Paths, game: &str, windows_only: bool) -> Result<()> {
+fn cmd_install(
+    paths: &Paths,
+    game: &str,
+    windows_only: bool,
+    package: Option<&str>,
+    build: Option<u64>,
+) -> Result<()> {
     let id = parse_game_id(game)?;
     let config = Config::load(paths)?;
     let api = ApiClient::new(config.session_cookie.as_deref())?;
 
     let title = api.game_title(id)?.unwrap_or_else(|| format!("game {id}"));
     let payload = api.packages(id)?;
-    let Some(choice) = select::choose(&payload, windows_only) else {
+    let package_id = package
+        .map(|q| select::find_package(&payload, q).map(|p| p.id))
+        .transpose()?;
+    let filter = Filter {
+        windows_only,
+        package_id,
+        build_id: build,
+    };
+    let Some(choice) = select::choose(&payload, &filter) else {
+        if let Some(b) = build {
+            bail!("build {b} is not an installable Linux or Windows build of {title} (see `joltux info {id}`)");
+        }
+        if package_id.is_some() {
+            bail!("that package of {title} has no installable Linux or Windows build (see `joltux info {id}`)");
+        }
         bail!(
             "{title} has no installable Linux or Windows build (Joltux supports .zip and .tar.gz archives, plus standalone Windows .exe files; installers are not supported)"
         );
     };
     let version = choice.release.map(|r| r.version_number.clone()).unwrap_or_default();
-    println!("Installing {title}: build {} ({})", choice.build.id, describe(choice.platform));
+    println!(
+        "Installing {title} [{}]: build {} ({})",
+        choice.package_title(),
+        choice.build.id,
+        describe(choice.platform)
+    );
+
+    // Games with e.g. a demo and a full version: say what else exists.
+    if package_id.is_none() && build.is_none() {
+        let any_package = Filter {
+            windows_only,
+            ..Default::default()
+        };
+        let mut others: Vec<String> = select::candidates(&payload, &any_package)
+            .iter()
+            .filter(|c| c.build.game_package_id != choice.build.game_package_id)
+            .map(|c| format!("\"{}\"", c.package_title()))
+            .collect();
+        others.sort();
+        others.dedup();
+        if !others.is_empty() {
+            println!(
+                "Note: other packages available: {} (pick one with --package)",
+                others.join(", ")
+            );
+        }
+    }
 
     let standalone_exe = choice.platform == Platform::Windows
         && choice
@@ -216,22 +284,34 @@ fn cmd_install(paths: &Paths, game: &str, windows_only: bool) -> Result<()> {
     let archive = paths.downloads_dir.join(format!("{}.archive", choice.build.id));
     install::download(&url, &archive)?;
 
+    // Unpack next to the real folder and only swap it in once it's known to
+    // be good, so a failed reinstall never breaks a working install.
     let dir = paths.game_dir(id);
-    if dir.exists() {
-        fs::remove_dir_all(&dir).context("could not clear the previous install")?;
+    let staging = install::sibling(&dir, "new");
+    if staging.exists() {
+        fs::remove_dir_all(&staging).context("could not clear a leftover partial install")?;
     }
-    let executable = if standalone_exe {
-        install::install_raw_executable(&archive, &dir, &executable_path)?
-    } else {
-        println!("Extracting...");
-        let extracted = install::extract(&archive, &dir, &choice.build.archive_type);
-        let _ = fs::remove_file(&archive); // the archive is no longer needed either way
-        extracted?;
-        install::find_executable(&dir, &executable_path)
-            .with_context(|| {
-                format!("installed, but could not find `{executable_path}` in the archive")
-            })?
+    let prepared = (|| -> Result<PathBuf> {
+        let exe = if standalone_exe {
+            install::install_raw_executable(&archive, &staging, &executable_path)?
+        } else {
+            println!("Extracting...");
+            install::extract(&archive, &staging, &choice.build.archive_type)?;
+            install::find_executable(&staging, &executable_path)
+                .with_context(|| format!("could not find `{executable_path}` in the archive"))?
+        };
+        Ok(exe.strip_prefix(&staging)?.to_path_buf())
+    })();
+    let _ = fs::remove_file(&archive); // the download is no longer needed either way
+    let relative_exe = match prepared {
+        Ok(rel) => rel,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(e.context("install failed; any previous install was left untouched"));
+        }
     };
+    install::swap_into_place(&staging, &dir)?;
+    let executable = dir.join(relative_exe);
 
     let mut library = Library::load(paths)?;
     library.upsert(InstalledGame {
@@ -434,12 +514,34 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Show => println!("{}", config.redacted()),
         ConfigAction::Set { key, value } => {
+            let value = match value {
+                Some(v) if v != "-" => v,
+                _ if key == "session_cookie" => read_secret("frontend cookie: ")?,
+                _ => bail!("missing value for `{key}`"),
+            };
             config.set(&key, &value)?;
             config.save(paths)?;
             println!("Saved.");
         }
     }
     Ok(())
+}
+
+/// Reads a secret without echoing it when run in a terminal, or one line
+/// from stdin when it's piped in.
+fn read_secret(prompt: &str) -> Result<String> {
+    let stdin = io::stdin();
+    if stdin.is_terminal() {
+        return rpassword::prompt_password(prompt)
+            .map(|s| s.trim().to_string())
+            .context("could not read from the terminal");
+    }
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("could not read from stdin")?;
+    Ok(line.trim().to_string())
 }
 
 #[cfg(test)]

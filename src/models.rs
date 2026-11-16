@@ -62,6 +62,8 @@ fn lenient_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 #[derive(Debug, Default, Deserialize)]
 pub struct PackagePayload {
     #[serde(default)]
+    pub packages: Vec<Package>,
+    #[serde(default)]
     pub releases: Vec<Release>,
     #[serde(default)]
     pub builds: Vec<Build>,
@@ -297,6 +299,24 @@ pub fn description_blocks(content: &str) -> Vec<DescriptionBlock> {
     blocks
 }
 
+/// A "package" is a named group of releases (e.g. "Demo", "Full game").
+#[derive(Debug, Clone, Deserialize)]
+pub struct Package {
+    #[serde(deserialize_with = "lenient_u64")]
+    pub id: u64,
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub title: String,
+}
+
+impl Package {
+    pub fn display_title(&self) -> String {
+        match self.title.trim() {
+            "" => format!("package {}", self.id),
+            t => t.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     #[serde(deserialize_with = "lenient_u64")]
@@ -307,12 +327,25 @@ pub struct Release {
     /// first match, so lower = preferred.
     #[serde(default)]
     pub sort: i64,
+    /// "published", "hidden" or "removed".
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub status: String,
+}
+
+impl Release {
+    /// Missing status counts as published; hidden and removed releases are
+    /// skipped.
+    pub fn is_published(&self) -> bool {
+        self.status.is_empty() || self.status == "published"
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Build {
     #[serde(deserialize_with = "lenient_u64")]
     pub id: u64,
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub game_package_id: u64,
     #[serde(default, deserialize_with = "lenient_u64")]
     pub game_release_id: u64,
     /// "downloadable", "html", "flash", "unity", "applet", "rom", ...
@@ -479,6 +512,10 @@ mod tests {
                 )
                 .unwrap();
 
+        assert_eq!(payload.packages[0].id, 258246645);
+        assert_eq!(payload.packages[0].display_title(), "Game");
+        assert_eq!(payload.builds[0].game_package_id, 258246645);
+        assert!(payload.releases[0].is_published());
         assert_eq!(payload.releases[0].id, 10);
         assert_eq!(payload.releases[0].version_number, "");
         assert_eq!(payload.builds[0].game_release_id, 10);

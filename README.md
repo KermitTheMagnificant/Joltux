@@ -15,6 +15,8 @@ games; Game Jolt account-library sync and social features are not implemented.
 ```
 joltux info    <game id | url>        # list available builds, shows which would install
 joltux install <game id | url>        # download + extract (add --windows to skip native Linux builds)
+joltux install <id> --package demo    # pick a package (e.g. demo vs full game) by name or ID
+joltux install <id> --build 987654    # pick an exact build listed by `joltux info`
 joltux list                           # installed games
 joltux run     <game id>              # launch (native, or through Proton/Wine)
 joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
@@ -28,6 +30,7 @@ joltux config set runner umu|wine
 joltux config set umu_path /path/to/umu-run
 joltux config set wine_path /path/to/wine
 joltux config set proton_path GE-Proton        # or a path to a Proton folder
+joltux config set session_cookie               # paste a browser `frontend` cookie at a hidden prompt
 ```
 
 A game's ID is the number at the end of its URL:
@@ -128,19 +131,23 @@ that uses it.
   feeds, friends, achievements, and messaging are not connected.
 - **Build formats:** .zip and .tar.gz archives, plus standalone Windows .exe
   files. Installer builds are not installable.
-- **No updates / no resume** of interrupted downloads.
+- **No game updates / no resume** of interrupted downloads. A failed
+  reinstall does leave the previous install working: new files go to a
+  temporary folder and are only swapped in once the executable is found.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
 - **Symlinks inside zips** are written as plain files.
 
 ## Layout
+
+Sources live in `src/`; icons in `assets/`.
 
 ```
 main.rs     CLI (clap) and the install/run/list/uninstall commands
 gui.rs      desktop client UI for Store search, local library, installation, account, and settings
 api.rs      Game Jolt site API client
 models.rs   serde types for API responses + the installed-game record
-select.rs   which build to install (native Linux first, then Windows)
-install.rs  download, extract, locate the executable
+select.rs   which build to install (native Linux first, then Windows; --package/--build)
+install.rs  download, extract, locate the executable, swap new installs into place
 launch.rs   run natively or through umu-run / wine
 runtime.rs  install umu-launcher and system Wine; configure GE-Proton
 config.rs   settings (runner, proton path, session cookie)

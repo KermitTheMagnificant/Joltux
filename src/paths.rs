@@ -29,6 +29,19 @@ impl Paths {
         })
     }
 
+    /// Everything under one folder; used by tests.
+    #[cfg(test)]
+    pub fn in_dir(root: &std::path::Path) -> Self {
+        Self {
+            config_file: root.join("config.json"),
+            library_file: root.join("library.json"),
+            games_dir: root.join("games"),
+            downloads_dir: root.join("downloads"),
+            prefixes_dir: root.join("prefixes"),
+            runtimes_dir: root.join("runtimes"),
+        }
+    }
+
     pub fn game_dir(&self, game_id: u64) -> PathBuf {
         self.games_dir.join(game_id.to_string())
     }

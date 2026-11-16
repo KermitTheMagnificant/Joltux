@@ -117,6 +117,26 @@ Games installed before Joltux recorded packages are matched to their package
 automatically when possible; if a game has several packages and its old build
 is gone, reinstall it once with `--package`.
 
+## The Library
+
+Games you start from the desktop app run in the background, so the rest of
+the app stays usable. A running game shows a **Stop** button, which asks it to
+quit; press it again (**Force stop**) to kill it. Closing Joltux leaves running
+games open. Each launch's output is saved to
+`~/.local/share/joltux/logs/<game id>.log`.
+
+Joltux records when you last played each game and your total playtime
+(`joltux run` from a terminal counts too). Sort the Library by recently played
+or by name. Games show their Game Jolt cover art; games installed by older
+versions of Joltux get theirs the next time the app opens.
+
+Right-click a game (or use its ☰ button) to open its folder, Wine prefix or
+last launch log, view it on Game Jolt, copy its ID, reinstall it, or remove
+it. Double-click a game to play it.
+
+When an install or update finishes while the Joltux window is in the
+background, you get a desktop notification (through `notify-send`).
+
 ## Per-game launch options
 
 Each game can have its own environment variables, game arguments, a wrapper
@@ -179,6 +199,7 @@ select.rs   which build to install (native Linux first, then Windows; --package/
 install.rs  download, extract, locate the executable, swap new installs into place
 launch.rs   run natively or through umu-run / wine, with per-game options
 updates.rs  find newer builds of installed games
+desktop.rs  games running from the GUI, xdg-open, desktop notifications
 runtime.rs  install umu-launcher and system Wine; configure GE-Proton
 config.rs   settings (runner, proton path, session cookie)
 library.rs  installed-games list

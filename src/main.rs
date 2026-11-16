@@ -6,6 +6,7 @@
 mod api;
 mod checks;
 mod config;
+mod desktop;
 mod gui;
 mod install;
 mod launch;
@@ -256,7 +257,8 @@ fn cmd_install(
     let config = Config::load(paths)?;
     let api = ApiClient::new(config.session_cookie.as_deref())?;
 
-    let title = api.game_title(id)?.unwrap_or_else(|| format!("game {id}"));
+    let summary = api.game_summary(id)?;
+    let title = summary.title.clone().unwrap_or_else(|| format!("game {id}"));
     let payload = api.packages(id)?;
     let package_id = package
         .map(|q| select::find_package(&payload, q).map(|p| p.id))
@@ -367,8 +369,11 @@ fn cmd_install(
     let executable = dir.join(relative_exe);
 
     let mut library = Library::load(paths)?;
-    // Reinstalls and upgrades keep the game's launch options.
-    let launch = library.find(id).map(|g| g.launch.clone()).unwrap_or_default();
+    // Reinstalls and upgrades keep the game's launch options and playtime.
+    let previous = library.find(id);
+    let launch = previous.map(|g| g.launch.clone()).unwrap_or_default();
+    let last_played = previous.and_then(|g| g.last_played);
+    let playtime_secs = previous.map_or(0, |g| g.playtime_secs);
     library.upsert(InstalledGame {
         game_id: id,
         title: title.clone(),
@@ -379,6 +384,10 @@ fn cmd_install(
         executable,
         package_id: Some(choice.build.game_package_id),
         launch,
+        slug: summary.slug,
+        thumbnail_url: summary.img_thumbnail,
+        last_played,
+        playtime_secs,
     });
     library.save(paths)?;
     println!("Done. Play with: joltux run {id}");
@@ -391,7 +400,32 @@ fn cmd_run(paths: &Paths, game_id: u64) -> Result<()> {
         .find(game_id)
         .with_context(|| format!("game {game_id} is not installed (see `joltux list`)"))?;
     let config = Config::load(paths)?;
-    launch::run(game, &config, paths)
+    let game = game.clone();
+
+    let started = std::time::Instant::now();
+    record_play(paths, game_id, |g| g.last_played = Some(library::now_secs()));
+    let result = launch::run(&game, &config, paths);
+    if result.is_ok() {
+        let secs = started.elapsed().as_secs();
+        record_play(paths, game_id, |g| g.playtime_secs += secs);
+    }
+    result
+}
+
+/// Updates a game's play statistics. Reloads the library first, since it may
+/// have changed while the game was running. A failure only costs the
+/// statistics, so it's reported but doesn't fail the command.
+fn record_play(paths: &Paths, game_id: u64, change: impl FnOnce(&mut InstalledGame)) {
+    let result = Library::load(paths).and_then(|mut library| {
+        if let Some(game) = library.find_mut(game_id) {
+            change(game);
+            library.save(paths)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = result {
+        eprintln!("note: could not save play time ({e:#})");
+    }
 }
 
 fn cmd_list(paths: &Paths) -> Result<()> {
@@ -400,8 +434,15 @@ fn cmd_list(paths: &Paths) -> Result<()> {
         println!("No games installed. Try: joltux install <game id or URL>");
     }
     for g in &library.games {
-        let tweaked = if g.launch.is_empty() { "" } else { "  (custom launch options)" };
-        println!("{:>8}  {}  [{}]{tweaked}", g.game_id, g.title, describe(g.platform));
+        let mut notes = Vec::new();
+        if g.playtime_secs > 0 {
+            notes.push(format!("{} played", library::format_playtime(g.playtime_secs)));
+        }
+        if !g.launch.is_empty() {
+            notes.push("custom launch options".to_owned());
+        }
+        let notes = if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) };
+        println!("{:>8}  {}  [{}]{notes}", g.game_id, g.title, describe(g.platform));
     }
     Ok(())
 }

@@ -13,6 +13,7 @@ pub struct Paths {
     pub downloads_dir: PathBuf,
     pub prefixes_dir: PathBuf,
     pub runtimes_dir: PathBuf,
+    pub logs_dir: PathBuf,
 }
 
 impl Paths {
@@ -26,6 +27,7 @@ impl Paths {
             downloads_dir: data.join("downloads"),
             prefixes_dir: data.join("prefixes"),
             runtimes_dir: data.join("runtimes"),
+            logs_dir: data.join("logs"),
         })
     }
 
@@ -39,6 +41,7 @@ impl Paths {
             downloads_dir: root.join("downloads"),
             prefixes_dir: root.join("prefixes"),
             runtimes_dir: root.join("runtimes"),
+            logs_dir: root.join("logs"),
         }
     }
 
@@ -47,6 +50,11 @@ impl Paths {
     }
 
     /// One Wine/Proton prefix per game so one broken game can't affect others.
+    /// Output of the game's last launch from the desktop app.
+    pub fn log_file(&self, game_id: u64) -> PathBuf {
+        self.logs_dir.join(format!("{game_id}.log"))
+    }
+
     pub fn prefix_dir(&self, game_id: u64) -> PathBuf {
         self.prefixes_dir.join(game_id.to_string())
     }

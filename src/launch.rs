@@ -14,6 +14,10 @@ use crate::models::InstalledGame;
 use crate::paths::Paths;
 use crate::select::Platform;
 
+/// When set, the game is started in its own process group (used by the
+/// desktop app; a terminal launch keeps Ctrl+C reaching the game).
+pub const OWN_PROCESS_GROUP_ENV: &str = "JOLTUX_GAME_PROCESS_GROUP";
+
 /// Runs the game and waits for it to exit.
 pub fn run(game: &InstalledGame, config: &Config, paths: &Paths) -> Result<()> {
     if !game.executable.is_file() {
@@ -30,6 +34,14 @@ pub fn run(game: &InstalledGame, config: &Config, paths: &Paths) -> Result<()> {
     }
     let runner = runner_for(game, config);
     let mut cmd = command(game, config, &prefix);
+    #[cfg(unix)]
+    if std::env::var_os(OWN_PROCESS_GROUP_ENV).is_some() {
+        // The desktop app stops a game by signalling this group, which also
+        // reaches whatever the game, Wine or umu start, but not this process,
+        // so playtime is still recorded.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     eprintln!("Launching {} ...", game.title);
     let status = match cmd.status() {
@@ -217,6 +229,10 @@ mod tests {
             executable: PathBuf::from("/games/1/Game.exe"),
             package_id: None,
             launch,
+            slug: None,
+            thumbnail_url: None,
+            last_played: None,
+            playtime_secs: 0,
         }
     }
 

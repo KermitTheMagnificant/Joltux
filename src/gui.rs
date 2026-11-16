@@ -9,13 +9,14 @@ use eframe::egui;
 
 use crate::api::{ApiClient, LoginOutcome};
 use crate::config::{Config, Runner};
+use crate::desktop::{self, RunningGame};
 use crate::launch;
-use crate::library::Library;
-use crate::models::{InstalledGame, LaunchSettings};
+use crate::library::{self, Library};
+use crate::models::{GameSummary, InstalledGame, LaunchSettings};
 use crate::paths::Paths;
 use crate::runtime;
 use crate::select::Platform;
-use crate::store::{Store, StoreAction};
+use crate::store::{self, Store, StoreAction};
 use crate::theme::{self, icon, AccentButton};
 use crate::updates::{self, Update};
 
@@ -76,6 +77,57 @@ enum TaskMessage {
     Output(String),
     /// The task finished; this becomes the status line.
     Done(String),
+}
+
+/// What a running CLI task does to which games, so the library can block
+/// conflicting actions and a notification can say what finished.
+struct GameTask {
+    kind: TaskKind,
+    games: Vec<u64>,
+    /// Title to use if the game isn't in the library (a failed install).
+    title: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    Install,
+    Update,
+    Remove,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibrarySort {
+    Recent,
+    Name,
+}
+
+/// Something done to one game from its library row or its menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Play,
+    Stop,
+    Update,
+    Reinstall,
+    Remove,
+    ToggleOptions,
+    OpenFolder,
+    OpenPrefix,
+    OpenLog,
+    ViewOnGameJolt,
+    CopyId,
+}
+
+/// What a game's row and menu need to know about it.
+struct RowState {
+    running: bool,
+    stopping: bool,
+    /// A task (install, update, remove) is running for this game.
+    in_task: bool,
+    /// Any task is running.
+    busy: bool,
+    has_update: bool,
+    prefix_exists: bool,
+    log_exists: bool,
 }
 
 /// Result of checking the whole library for updates.
@@ -179,6 +231,13 @@ struct JoltuxApp {
     /// Outcome of the last update check, shown above the library.
     update_note: String,
     launch_editor: Option<LaunchEditor>,
+    /// Games started from the app, by game ID.
+    running: HashMap<u64, RunningGame>,
+    /// The games the running CLI task affects.
+    task: Option<GameTask>,
+    library_sort: LibrarySort,
+    /// Fetches slugs and cover art for games installed before Joltux saved them.
+    cover_backfill: Option<Receiver<Vec<(u64, GameSummary)>>>,
 }
 
 impl JoltuxApp {
@@ -215,7 +274,222 @@ impl JoltuxApp {
             updates_checked: false,
             update_note: String::new(),
             launch_editor: None,
-        })
+            running: HashMap::new(),
+            task: None,
+            library_sort: LibrarySort::Recent,
+            cover_backfill: None,
+        }
+        .with_cover_backfill())
+    }
+
+    /// Starts fetching slugs and covers for games that lack them.
+    fn with_cover_backfill(mut self) -> Self {
+        let missing: Vec<u64> = self
+            .games
+            .iter()
+            .filter(|g| g.thumbnail_url.is_none() || g.slug.is_none())
+            .map(|g| g.game_id)
+            .collect();
+        if missing.is_empty() {
+            return self;
+        }
+        let session = self.config.session_cookie.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.cover_backfill = Some(receiver);
+        std::thread::spawn(move || {
+            let Ok(api) = ApiClient::new(session.as_deref()) else { return };
+            let found = missing
+                .into_iter()
+                .filter_map(|id| api.game_summary(id).ok().map(|summary| (id, summary)))
+                .collect();
+            let _ = sender.send(found);
+        });
+        self
+    }
+
+    /// Saves backfilled covers into the library. Waits while a task runs, so
+    /// this never races a CLI command writing the library.
+    fn poll_cover_backfill(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(receiver) = &self.cover_backfill else { return };
+        let found = match receiver.try_recv() {
+            Ok(found) => found,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.cover_backfill = None;
+        if found.is_empty() {
+            return;
+        }
+        let saved = Library::load(&self.paths).and_then(|mut library| {
+            for (id, summary) in found {
+                if let Some(game) = library.find_mut(id) {
+                    game.slug = game.slug.take().or(summary.slug);
+                    game.thumbnail_url = game.thumbnail_url.take().or(summary.img_thumbnail);
+                }
+            }
+            library.save(&self.paths)
+        });
+        if saved.is_ok() {
+            self.refresh();
+        }
+    }
+
+    /// Runs a CLI command that installs, updates or removes `games`.
+    fn run_game_task(&mut self, args: Vec<String>, kind: TaskKind, games: Vec<u64>, title: Option<String>) {
+        self.run_cli(args);
+        if self.busy && self.task.is_none() {
+            self.task = Some(GameTask { kind, games, title });
+        }
+    }
+
+    /// Called when a CLI task finishes, after the library was reloaded.
+    /// Notifies the desktop about installs and updates when the window isn't
+    /// focused, since those can take a while.
+    fn finish_task(&mut self, window_focused: bool) {
+        let Some(task) = self.task.take() else { return };
+        if window_focused || task.kind == TaskKind::Remove {
+            return;
+        }
+        let failed = is_failure(&self.status);
+        let titles: Vec<String> = task
+            .games
+            .iter()
+            .map(|id| match self.games.iter().find(|g| g.game_id == *id) {
+                Some(game) => game.title.clone(),
+                None => task.title.clone().unwrap_or_else(|| format!("game {id}")),
+            })
+            .collect();
+        let name = match titles.as_slice() {
+            [one] => one.clone(),
+            [] => "your games".to_owned(),
+            many => format!("{} games", many.len()),
+        };
+        let (summary, body) = match (task.kind, failed) {
+            (TaskKind::Install, false) => (format!("{name} is installed"), "Ready to play.".to_owned()),
+            (TaskKind::Install, true) => (format!("Couldn't install {name}"), first_line(&self.status)),
+            (_, false) => (format!("Updated {name}"), titles.join(", ")),
+            (_, true) => (format!("Couldn't update {name}"), first_line(&self.status)),
+        };
+        desktop::notify(&summary, &body);
+    }
+
+    fn play(&mut self, game: &InstalledGame) {
+        if self.running.contains_key(&game.game_id) {
+            return;
+        }
+        match RunningGame::start(&self.paths, game.game_id) {
+            Ok(running) => {
+                self.running.insert(game.game_id, running);
+                self.status = format!("Playing {}.", game.title);
+            }
+            Err(error) => self.status = format!("Could not start {}: {error:#}", game.title),
+        }
+    }
+
+    /// Notices games that have exited.
+    fn poll_running(&mut self) {
+        let mut exited = Vec::new();
+        for (id, game) in &mut self.running {
+            if let Some(status) = game.finished() {
+                exited.push((*id, status, game.started.elapsed().as_secs(), game.stopping));
+            }
+        }
+        if exited.is_empty() {
+            return;
+        }
+        for (id, ..) in &exited {
+            self.running.remove(id);
+        }
+        // Picks up the playtime `joltux run` saved.
+        self.refresh();
+        for (id, status, secs, stopped) in exited {
+            let title = self
+                .games
+                .iter()
+                .find(|g| g.game_id == id)
+                .map_or_else(|| format!("game {id}"), |g| g.title.clone());
+            self.status = if status.success() || stopped {
+                format!("Finished playing {title} ({}).", library::format_playtime(secs))
+            } else {
+                let log = desktop::log_tail(&self.paths.log_file(id), 4);
+                format!("Could not run {title}:\n{log}")
+            };
+        }
+    }
+
+    fn row_state(&self, game: &InstalledGame) -> RowState {
+        let running = self.running.get(&game.game_id);
+        RowState {
+            running: running.is_some(),
+            stopping: running.is_some_and(|r| r.stopping),
+            in_task: self.task.as_ref().is_some_and(|t| t.games.contains(&game.game_id)),
+            busy: self.busy,
+            has_update: self.updates.contains_key(&game.game_id),
+            prefix_exists: game.platform == Platform::Windows && self.paths.prefix_dir(game.game_id).is_dir(),
+            log_exists: self.paths.log_file(game.game_id).is_file(),
+        }
+    }
+
+    fn apply_row_action(&mut self, ctx: &egui::Context, game: &InstalledGame, action: RowAction) {
+        let id = game.game_id;
+        let opened = match action {
+            RowAction::Play => {
+                self.play(game);
+                Ok(())
+            }
+            RowAction::Stop => {
+                if let Some(running) = self.running.get_mut(&id) {
+                    running.stop();
+                }
+                Ok(())
+            }
+            RowAction::Update => {
+                self.run_game_task(vec!["upgrade".into(), id.to_string()], TaskKind::Update, vec![id], None);
+                if self.busy {
+                    self.status = format!("Updating {}...", game.title);
+                }
+                Ok(())
+            }
+            RowAction::Reinstall => {
+                let mut args = vec!["install".into(), id.to_string(), "--build".into(), game.build_id.to_string()];
+                if game.platform == Platform::Windows {
+                    args.push("--windows".into());
+                }
+                self.run_game_task(args, TaskKind::Install, vec![id], Some(game.title.clone()));
+                if self.busy {
+                    self.status = format!("Reinstalling {}...", game.title);
+                }
+                Ok(())
+            }
+            RowAction::Remove => {
+                let mut args = vec!["uninstall".into(), id.to_string()];
+                if self.remove_prefix {
+                    args.push("--prefix".into());
+                }
+                self.run_game_task(args, TaskKind::Remove, vec![id], None);
+                Ok(())
+            }
+            RowAction::ToggleOptions => {
+                let editing = self.launch_editor.as_ref().is_some_and(|e| e.game_id == id);
+                self.launch_editor = (!editing).then(|| LaunchEditor::new(game));
+                Ok(())
+            }
+            RowAction::OpenFolder => desktop::open(&game.install_dir),
+            RowAction::OpenPrefix => desktop::open(self.paths.prefix_dir(id)),
+            RowAction::OpenLog => desktop::open(self.paths.log_file(id)),
+            RowAction::ViewOnGameJolt => desktop::open(game_page_url(game)),
+            RowAction::CopyId => {
+                ctx.copy_text(id.to_string());
+                self.status = format!("Copied the ID of {} ({id}).", game.title);
+                Ok(())
+            }
+        };
+        if let Err(error) = opened {
+            self.status = format!("Could not open it: {error:#}");
+        }
     }
 
     /// Checks every installed game for a newer build on a background thread.
@@ -379,7 +653,12 @@ impl JoltuxApp {
             }
             Some(StoreAction::Install { game_id, title }) => {
                 self.game_input = game_id.to_string();
-                self.run_cli(vec!["install".into(), game_id.to_string()]);
+                self.run_game_task(
+                    vec!["install".into(), game_id.to_string()],
+                    TaskKind::Install,
+                    vec![game_id],
+                    Some(title.clone()),
+                );
                 if self.busy {
                     self.status = format!("Installing {title}... this can take a while for large games.");
                 }
@@ -430,17 +709,29 @@ impl JoltuxApp {
                 if ui.add_enabled(idle, egui::Button::new("Check for updates")).clicked() {
                     self.check_updates();
                 }
+                // Games that are running are left for later.
+                let ready: Vec<u64> =
+                    self.updates.keys().copied().filter(|id| !self.running.contains_key(id)).collect();
                 if !self.updates.is_empty() {
                     let label = format!("Update all ({})", self.updates.len());
-                    if ui.add_enabled(idle, AccentButton::new(label)).clicked() {
+                    let button = ui
+                        .add_enabled(idle && !ready.is_empty(), AccentButton::new(label))
+                        .on_disabled_hover_text("Close running games to update them");
+                    if button.clicked() {
                         let mut args = vec!["upgrade".to_owned()];
-                        args.extend(self.updates.keys().map(u64::to_string));
-                        self.run_cli(args);
+                        args.extend(ready.iter().map(u64::to_string));
+                        self.run_game_task(args, TaskKind::Update, ready, None);
                         if self.busy {
                             self.status = "Updating games...".into();
                         }
                     }
                 }
+                theme::segmented(
+                    ui,
+                    "library_sort",
+                    &mut self.library_sort,
+                    &[(LibrarySort::Name, "A–Z"), (LibrarySort::Recent, "Recent")],
+                );
             });
         });
         ui.add_space(4.0);
@@ -451,7 +742,17 @@ impl JoltuxApp {
             .max_height(list_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for game in self.games.clone() {
+                let mut games = self.games.clone();
+                if self.library_sort == LibrarySort::Recent {
+                    // Running games count as played now. The library is
+                    // already sorted by title, and the sort is stable.
+                    let now = library::now_secs();
+                    let running = &self.running;
+                    games.sort_by_key(|g| {
+                        std::cmp::Reverse(if running.contains_key(&g.game_id) { Some(now) } else { g.last_played })
+                    });
+                }
+                for game in games {
                     self.library_row(ui, &game);
                     ui.add_space(2.0);
                 }
@@ -468,105 +769,150 @@ impl JoltuxApp {
     fn library_row(&mut self, ui: &mut egui::Ui, game: &InstalledGame) {
         let linux = game.platform == Platform::Linux;
         let tint = if linux { theme::ACCENT } else { theme::BLUE };
+        let state = self.row_state(game);
+        let mut action = None;
 
         // Hover is read from the previous frame, because the card's background
         // has to be chosen before its contents are laid out.
         let id = ui.id().with(("library_row", game.game_id));
         let was_hovered = ui.ctx().data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
         let hover = ui.ctx().animate_bool_with_time(id, was_hovered, theme::FAST);
+        let border = if state.running { theme::ACCENT_BRIGHT } else { tint };
 
-        let response = theme::card()
-            .fill(theme::mix(theme::SURFACE, theme::SURFACE_HI, hover))
-            .stroke(egui::Stroke::new(1.0_f32, theme::mix(theme::BORDER, tint, hover * 0.8)))
-            .inner_margin(egui::Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    // A coloured tile with the game's initial stands in for cover art.
-                    let (tile, _) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::hover());
-                    ui.painter().rect_filled(tile, egui::CornerRadius::same(10), tint.gamma_multiply(0.22));
-                    let initial = game
-                        .title
-                        .chars()
-                        .find(|c| c.is_alphanumeric())
-                        .map(|c| c.to_uppercase().to_string())
-                        .unwrap_or_else(|| "?".into());
-                    ui.painter().text(
-                        tile.center(),
-                        egui::Align2::CENTER_CENTER,
-                        initial,
-                        egui::FontId::proportional(22.0),
-                        tint,
-                    );
-                    ui.add_space(4.0);
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(!self.busy, AccentButton::new(format!("{}  Play", icon::PLAY)))
-                            .clicked()
-                        {
-                            self.run_cli(vec!["run".into(), game.game_id.to_string()]);
-                        }
-                        if ui.add_enabled(!self.busy, AccentButton::danger("Remove")).clicked() {
-                            let mut args = vec!["uninstall".into(), game.game_id.to_string()];
-                            if self.remove_prefix {
-                                args.push("--prefix".into());
-                            }
-                            self.run_cli(args);
-                        }
-                        let editing = self.launch_editor.as_ref().is_some_and(|e| e.game_id == game.game_id);
-                        let options = egui::Button::new(icon::SETTINGS).selected(editing);
-                        if ui.add(options).on_hover_text("Launch options").clicked() {
-                            self.launch_editor = (!editing).then(|| LaunchEditor::new(game));
-                        }
-                        if let Some(update) = self.updates.get(&game.game_id) {
-                            let button = egui::Button::new(egui::RichText::new("Update").color(theme::AMBER));
-                            let hover = format!("Install {} (build {})", version_text(&update.version), update.build_id);
-                            if ui.add_enabled(!self.busy, button).on_hover_text(hover).clicked() {
-                                self.run_cli(vec!["upgrade".into(), game.game_id.to_string()]);
-                                if self.busy {
-                                    self.status = format!("Updating {}...", game.title);
+        // The whole card senses clicks for the right-click menu and
+        // double-click to play; its buttons sit on top and still get theirs.
+        let card = ui.scope_builder(
+            egui::UiBuilder::new().id_salt(("library_card", game.game_id)).sense(egui::Sense::click()),
+            |ui| {
+                theme::card()
+                    .fill(theme::mix(theme::SURFACE, theme::SURFACE_HI, hover))
+                    .stroke(egui::Stroke::new(1.0_f32, theme::mix(theme::BORDER, border, hover * 0.8)))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            cover_tile(ui, game, tint);
+                            ui.add_space(4.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if let Some(chosen) = self.row_buttons(ui, game, &state) {
+                                    action = Some(chosen);
                                 }
-                            }
-                        }
-                        // Whatever is left belongs to the title, which truncates.
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.spacing_mut().item_spacing.y = 4.0;
-                            ui.spacing_mut().interact_size.y = 18.0;
-                            ui.add_space(3.0);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&game.title).size(16.0).color(egui::Color32::WHITE),
-                                )
-                                .truncate(),
-                            );
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                theme::badge(ui, if linux { "Linux" } else { "Windows · Proton/Wine" }, tint);
-                                if let Some(update) = self.updates.get(&game.game_id) {
-                                    theme::badge(ui, &format!("{} available", version_text(&update.version)), theme::AMBER);
-                                }
-                                if !game.launch.is_empty() {
-                                    theme::badge(ui, "Custom launch", theme::TEXT_DIM);
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!("{}  ·  ID {}", version_text(&game.version), game.game_id))
-                                        .small()
-                                        .color(theme::TEXT_DIM),
-                                );
+                                // Whatever is left belongs to the title, which truncates.
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    self.row_details(ui, game, &state, tint);
+                                });
                             });
                         });
+                        if self.launch_editor.as_ref().is_some_and(|e| e.game_id == game.game_id) {
+                            ui.add_space(8.0);
+                            ui.separator();
+                            self.launch_editor_ui(ui, game);
+                        }
                     });
-                });
-                if self.launch_editor.as_ref().is_some_and(|e| e.game_id == game.game_id) {
-                    ui.add_space(8.0);
-                    ui.separator();
-                    self.launch_editor_ui(ui, game);
-                }
-            })
-            .response;
+            },
+        );
+        let response = card.response;
+        response.context_menu(|ui| {
+            if let Some(chosen) = game_menu(ui, game, &state) {
+                action = Some(chosen);
+                ui.close_menu();
+            }
+        });
+        if response.double_clicked() && !state.running && !state.in_task {
+            action = Some(RowAction::Play);
+        }
         let hovered = ui.rect_contains_pointer(response.rect);
         ui.ctx().data_mut(|data| data.insert_temp(id, hovered));
+
+        if let Some(action) = action {
+            self.apply_row_action(ui.ctx(), game, action);
+        }
+    }
+
+    /// Play/Stop, the menu button and Update, laid out right to left.
+    fn row_buttons(&self, ui: &mut egui::Ui, game: &InstalledGame, state: &RowState) -> Option<RowAction> {
+        let mut action = None;
+        if state.running {
+            let label = if state.stopping { "Force stop" } else { "Stop" };
+            let hover = if state.stopping {
+                "The game didn't quit; kill it"
+            } else {
+                "Ask the game to quit"
+            };
+            if ui.add(AccentButton::danger(format!("{}  {label}", icon::STOP))).on_hover_text(hover).clicked() {
+                action = Some(RowAction::Stop);
+            }
+        } else if ui
+            .add_enabled(!state.in_task, AccentButton::new(format!("{}  Play", icon::PLAY)))
+            .clicked()
+        {
+            action = Some(RowAction::Play);
+        }
+        let menu = ui.menu_button(icon::MORE, |ui| {
+            let chosen = game_menu(ui, game, state);
+            if chosen.is_some() {
+                ui.close_menu();
+            }
+            chosen
+        });
+        if let Some(chosen) = menu.inner.flatten() {
+            action = Some(chosen);
+        }
+        menu.response.on_hover_text("More actions (or right-click the game)");
+        if let Some(update) = self.updates.get(&game.game_id) {
+            let button = egui::Button::new(egui::RichText::new("Update").color(theme::AMBER));
+            let hover = format!("Install {} (build {})", version_text(&update.version), update.build_id);
+            if ui
+                .add_enabled(!state.busy && !state.running, button)
+                .on_hover_text(hover)
+                .on_disabled_hover_text("Close the game to update it")
+                .clicked()
+            {
+                action = Some(RowAction::Update);
+            }
+        }
+        action
+    }
+
+    /// Title, badges and play statistics.
+    fn row_details(&self, ui: &mut egui::Ui, game: &InstalledGame, state: &RowState, tint: egui::Color32) {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.spacing_mut().interact_size.y = 18.0;
+        ui.add_space(3.0);
+        ui.add(
+            egui::Label::new(egui::RichText::new(&game.title).size(16.0).color(egui::Color32::WHITE))
+                .truncate()
+                .selectable(false),
+        );
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if let Some(running) = self.running.get(&game.game_id) {
+                let played = library::format_playtime(running.started.elapsed().as_secs());
+                theme::badge(ui, &format!("{}  Playing · {played}", icon::PLAY), theme::ACCENT_BRIGHT);
+            }
+            theme::badge(ui, if game.platform == Platform::Linux { "Linux" } else { "Windows · Proton/Wine" }, tint);
+            if let Some(update) = self.updates.get(&game.game_id) {
+                theme::badge(ui, &format!("{} available", version_text(&update.version)), theme::AMBER);
+            }
+            if !game.launch.is_empty() {
+                theme::badge(ui, "Custom launch", theme::TEXT_DIM);
+            }
+            let mut details = vec![version_text(&game.version)];
+            if game.playtime_secs > 0 {
+                details.push(format!("{} played", library::format_playtime(game.playtime_secs)));
+            }
+            if !state.running {
+                details.push(match game.last_played {
+                    Some(when) => format!("last played {}", library::format_ago(when, library::now_secs())),
+                    None => "not played yet".to_owned(),
+                });
+            }
+            ui.add(
+                egui::Label::new(egui::RichText::new(details.join("  ·  ")).small().color(theme::TEXT_DIM))
+                    .truncate()
+                    .selectable(false),
+            );
+        });
     }
 
     /// The launch options form shown under a library row.
@@ -658,7 +1004,8 @@ impl JoltuxApp {
                     if self.windows_only {
                         args.push("--windows".into());
                     }
-                    self.run_cli(args);
+                    let games = crate::parse_game_id(&self.game_input).into_iter().collect();
+                    self.run_game_task(args, TaskKind::Install, games, None);
                 }
                 if ui.add_enabled(ready, egui::Button::new("Inspect builds")).clicked() {
                     self.run_cli(vec!["info".into(), self.game_input.trim().to_owned()]);
@@ -1021,6 +1368,86 @@ impl JoltuxApp {
     }
 }
 
+/// The game's cover art, or a coloured tile with its initial while the
+/// image loads, when there is none, or when it can't be fetched.
+fn cover_tile(ui: &mut egui::Ui, game: &InstalledGame, tint: egui::Color32) {
+    let (tile, _) = ui.allocate_exact_size(egui::vec2(82.0, 46.0), egui::Sense::hover());
+    let radius = egui::CornerRadius::same(8);
+    let cover = game
+        .thumbnail_url
+        .as_deref()
+        .filter(|url| store::is_gamejolt_media(url))
+        .map(|url| store::resize_media_url(url, 200))
+        .and_then(|url| match egui::Image::new(url).load_for_size(ui.ctx(), tile.size()) {
+            Ok(egui::load::TexturePoll::Ready { texture }) => Some(texture),
+            _ => None,
+        });
+    if let Some(texture) = cover {
+        egui::Image::from_texture(texture).corner_radius(radius).paint_at(ui, tile);
+        return;
+    }
+    ui.painter().rect_filled(tile, radius, tint.gamma_multiply(0.22));
+    let initial = game
+        .title
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    ui.painter().text(tile.center(), egui::Align2::CENTER_CENTER, initial, egui::FontId::proportional(22.0), tint);
+}
+
+/// The actions menu for a game, used by its menu button and right-click.
+fn game_menu(ui: &mut egui::Ui, game: &InstalledGame, state: &RowState) -> Option<RowAction> {
+    ui.set_min_width(190.0);
+    let mut action = None;
+    let mut item = |ui: &mut egui::Ui, enabled: bool, label: &str, chosen: RowAction| {
+        if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            action = Some(chosen);
+        }
+    };
+    if state.running {
+        item(ui, true, if state.stopping { "Force stop" } else { "Stop" }, RowAction::Stop);
+    } else {
+        item(ui, !state.in_task, "Play", RowAction::Play);
+    }
+    item(ui, true, "Launch options...", RowAction::ToggleOptions);
+    ui.separator();
+    item(ui, true, "Open game folder", RowAction::OpenFolder);
+    if game.platform == Platform::Windows {
+        item(ui, state.prefix_exists, "Open Wine prefix", RowAction::OpenPrefix);
+    }
+    item(ui, state.log_exists, "Open last launch log", RowAction::OpenLog);
+    item(ui, true, "View on Game Jolt", RowAction::ViewOnGameJolt);
+    item(ui, true, "Copy game ID", RowAction::CopyId);
+    ui.separator();
+    let idle = !state.busy && !state.running;
+    if state.has_update {
+        item(ui, idle, "Update", RowAction::Update);
+    }
+    item(ui, idle, "Reinstall", RowAction::Reinstall);
+    if ui
+        .add_enabled(idle, egui::Button::new(egui::RichText::new("Remove").color(theme::DANGER)))
+        .clicked()
+    {
+        action = Some(RowAction::Remove);
+    }
+    action
+}
+
+/// The game's page; Game Jolt redirects to the right slug if ours is stale.
+fn game_page_url(game: &InstalledGame) -> String {
+    let slug = game
+        .slug
+        .as_deref()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        .unwrap_or("game");
+    format!("https://gamejolt.com/games/{slug}/{}", game.game_id)
+}
+
+fn first_line(text: &str) -> String {
+    text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default().to_owned()
+}
+
 fn version_text(version: &str) -> String {
     match version.trim().trim_start_matches('v') {
         "" => "version unknown".to_owned(),
@@ -1048,11 +1475,20 @@ impl eframe::App for JoltuxApp {
             self.task_output.clear();
             self.busy = false;
             self.refresh();
+            let viewport = ctx.input(|input| input.viewport().clone());
+            let focused = viewport.focused != Some(false) && viewport.minimized != Some(true);
+            self.finish_task(focused);
         }
         self.store.poll();
         self.poll_update_check();
-        if self.update_check.is_some() {
+        self.poll_cover_backfill();
+        self.poll_running();
+        if self.update_check.is_some() || self.cover_backfill.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        if !self.running.is_empty() {
+            // Notices exits and keeps the play timers ticking.
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if self.store.is_loading() {
             // Loading placeholders pulse, so keep drawing frames.

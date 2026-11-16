@@ -420,6 +420,33 @@ pub struct InstalledGame {
     pub package_id: Option<u64>,
     #[serde(default, skip_serializing_if = "LaunchSettings::is_empty")]
     pub launch: LaunchSettings,
+    /// The game's URL slug, for linking to its Game Jolt page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// Cover image on Game Jolt's media server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    /// When the game was last started, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<u64>,
+    /// Total time played through Joltux, in seconds.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub playtime_secs: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// The few fields of `GET /web/discover/games/:id` an install records.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GameSummary {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub img_thumbnail: Option<String>,
 }
 
 /// Per-game launch tweaks, on top of the global settings.

@@ -36,9 +36,11 @@ pub mod icon {
     pub const PLAY: &str = "▶";
     pub const CLOSE: &str = "✖";
     pub const HEART: &str = "♥";
+    pub const STOP: &str = "⏹";
+    pub const MORE: &str = "☰";
     #[cfg(test)]
     pub const ALL: &[&str] = &[
-        STORE, LIBRARY, ADD, ACCOUNT, SETTINGS, BACK, SEARCH, PLAY, CLOSE, HEART,
+        STORE, LIBRARY, ADD, ACCOUNT, SETTINGS, BACK, SEARCH, PLAY, CLOSE, HEART, STOP, MORE,
     ];
 }
 

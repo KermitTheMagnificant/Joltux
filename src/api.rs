@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderValue, COOKIE, SET_COOKIE};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
-use crate::models::{GameDetails, GameInfo, GameMedia, GameSearchPayload, PackagePayload};
+use crate::models::{GameDetails, GameInfo, GameMedia, GameSearchPayload, GameSummary, PackagePayload};
 
 pub const USER_AGENT: &str = concat!("Joltux/", env!("CARGO_PKG_VERSION"), " (unofficial Linux launcher)");
 const BASE: &str = "https://gamejolt.com/site-api";
@@ -173,11 +173,16 @@ impl ApiClient {
 
     /// Game title, if the response has the shape we expect.
     pub fn game_title(&self, game_id: u64) -> Result<Option<String>> {
+        Ok(self.game_summary(game_id)?.title)
+    }
+
+    /// Title, slug and cover image; fields the response lacks are `None`.
+    pub fn game_summary(&self, game_id: u64) -> Result<GameSummary> {
         let payload = self.get(&format!("/web/discover/games/{game_id}"))?;
         Ok(payload
-            .pointer("/game/title")
-            .and_then(Value::as_str)
-            .map(str::to_owned))
+            .get("game")
+            .and_then(|game| serde_json::from_value(game.clone()).ok())
+            .unwrap_or_default())
     }
 
     /// Searches public games using the same route as the Game Jolt website.

@@ -110,6 +110,10 @@ mod tests {
             executable: PathBuf::new(),
             package_id,
             launch: LaunchSettings::default(),
+            slug: None,
+            thumbnail_url: None,
+            last_played: None,
+            playtime_secs: 0,
         }
     }
 

@@ -54,3 +54,63 @@ impl Library {
         Some(self.games.remove(idx))
     }
 }
+
+/// Seconds since the Unix epoch.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Time played, e.g. "45m" or "3h 12m".
+pub fn format_playtime(secs: u64) -> String {
+    let minutes = secs / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, 0) => "under a minute".to_owned(),
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// How long ago a timestamp was, e.g. "5 min ago" or "yesterday".
+pub fn format_ago(then: u64, now: u64) -> String {
+    let secs = now.saturating_sub(then);
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match secs {
+        0..60 => "just now".to_owned(),
+        60..3_600 => format!("{} min ago", secs / 60),
+        3_600..86_400 => plural(secs / 3_600, "hour"),
+        86_400..172_800 => "yesterday".to_owned(),
+        172_800..2_592_000 => plural(secs / 86_400, "day"),
+        2_592_000..31_536_000 => plural(secs / 2_592_000, "month"),
+        _ => plural(secs / 31_536_000, "year"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_ago, format_playtime};
+
+    #[test]
+    fn formats_playtime() {
+        assert_eq!(format_playtime(30), "under a minute");
+        assert_eq!(format_playtime(45 * 60), "45m");
+        assert_eq!(format_playtime(2 * 3600), "2h");
+        assert_eq!(format_playtime(3 * 3600 + 12 * 60 + 59), "3h 12m");
+    }
+
+    #[test]
+    fn formats_time_ago() {
+        let now = 1_000_000_000;
+        assert_eq!(format_ago(now - 10, now), "just now");
+        assert_eq!(format_ago(now - 300, now), "5 min ago");
+        assert_eq!(format_ago(now - 3_600, now), "1 hour ago");
+        assert_eq!(format_ago(now - 90_000, now), "yesterday");
+        assert_eq!(format_ago(now - 3 * 86_400, now), "3 days ago");
+        assert_eq!(format_ago(now - 65 * 86_400, now), "2 months ago");
+        assert_eq!(format_ago(now - 800 * 86_400, now), "2 years ago");
+        assert_eq!(format_ago(now + 50, now), "just now");
+    }
+}

@@ -793,7 +793,7 @@ fn media_preview_url(item: &GameMedia, width: u32) -> Option<String> {
 }
 
 /// `https://m.gjcdn.net/game-screenshot/400/x.webp` -> `.../<width>/x.webp`.
-fn resize_media_url(url: &str, width: u32) -> String {
+pub fn resize_media_url(url: &str, width: u32) -> String {
     let Ok(mut parsed) = reqwest::Url::parse(url) else {
         return url.to_owned();
     };

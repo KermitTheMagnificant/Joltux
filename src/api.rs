@@ -13,7 +13,11 @@ use serde_json::{json, Value};
 
 use crate::models::PackagePayload;
 
-pub const USER_AGENT: &str = concat!("Joltux/", env!("CARGO_PKG_VERSION"), " (unofficial Linux launcher)");
+pub const USER_AGENT: &str = concat!(
+    "Joltux/",
+    env!("CARGO_PKG_VERSION"),
+    " (unofficial Linux launcher)"
+);
 const BASE: &str = "https://gamejolt.com/site-api";
 
 pub struct ApiClient {
@@ -58,7 +62,9 @@ impl ApiClient {
         if !status.is_success() {
             bail!("GET {url} returned HTTP {status}");
         }
-        Ok(Self::unwrap_payload(resp.json().context("response was not JSON")?))
+        Ok(Self::unwrap_payload(
+            resp.json().context("response was not JSON")?,
+        ))
     }
 
     fn post(&self, path: &str, body: &Value) -> Result<Value> {
@@ -73,7 +79,9 @@ impl ApiClient {
         if !status.is_success() {
             bail!("POST {url} returned HTTP {status}");
         }
-        Ok(Self::unwrap_payload(resp.json().context("response was not JSON")?))
+        Ok(Self::unwrap_payload(
+            resp.json().context("response was not JSON")?,
+        ))
     }
 
     /// Game title, if the response has the shape we expect.

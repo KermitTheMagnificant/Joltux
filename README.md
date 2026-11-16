@@ -8,13 +8,15 @@ Linux builds; falls back to Windows builds run through Proton (via
 ```
 joltux info    <game id | url>        # list available builds, shows which would install
 joltux install <game id | url>        # download + extract (add --windows to skip native Linux builds)
+joltux install <id> --package demo    # pick a package (e.g. demo vs full game) by name or ID
+joltux install <id> --build 987654    # pick an exact build listed by `joltux info`
 joltux list                           # installed games
 joltux run     <game id>              # launch (native, or through Proton/Wine)
 joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
 joltux config show
 joltux config set runner umu|wine
 joltux config set proton_path GE-Proton        # or a path to a Proton folder
-joltux config set session_cookie <value>       # only needed for account-only games
+joltux config set session_cookie               # only needed for account-only games; prompts for the value
 ```
 
 A game's ID is the number at the end of its URL:
@@ -69,7 +71,7 @@ the umu-run environment/arguments for Windows launches.
 
 **NOT verified against the live Game Jolt service.** The sandbox this was
 written in could not reach gamejolt.com. The endpoints and response shapes in
-`src/api.rs` / `src/models.rs` were taken from the official client's source
+[`src/api.rs`](src/api.rs) / [`src/models.rs`](src/models.rs) were taken from the official client's source
 (github.com/gamejolt/gamejolt, MIT) and may be wrong or have changed:
 
 - `GET  /web/discover/games/:id` (title)
@@ -87,13 +89,17 @@ that uses it.
 - **Login.** The site's login uses captchas and login-approval flows, so Joltux
   doesn't do username/password login. Public free games work anonymously; for
   anything account-linked, copy the `frontend` cookie from a logged-in browser
-  session into `joltux config set session_cookie ...`. A proper OAuth-style login
+  session and paste it when `joltux config set session_cookie` prompts
+  for it (or pipe it in). Leaving the value off the command line keeps it out
+  of your shell history. The config file is only readable by your user. A proper OAuth-style login
   is future work.
 - **No library sync** (`/web/library` and `/web/client/sync` aren't used yet).
   You install by game ID/URL.
 - **Archive formats:** only .zip and .tar.gz. 7z and others are rejected with
   a clear error.
-- **No updates / no resume** of interrupted downloads.
+- **No updates / no resume** of interrupted downloads. A failed reinstall
+  does leave the previous install working: new files are extracted to a
+  temporary folder and only swapped in once the executable is found.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
 - **Symlinks inside zips** are written as plain files.
 - No GUI. It is CLI-only; the modules are split so a GUI can sit on top.

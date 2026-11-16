@@ -16,7 +16,8 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("", "", "joltux").context("could not determine home directory")?;
+        let dirs =
+            ProjectDirs::from("", "", "joltux").context("could not determine home directory")?;
         let data = dirs.data_dir();
         Ok(Self {
             config_file: dirs.config_dir().join("config.json"),
@@ -25,6 +26,18 @@ impl Paths {
             downloads_dir: data.join("downloads"),
             prefixes_dir: data.join("prefixes"),
         })
+    }
+
+    /// Everything under one folder; used by tests.
+    #[cfg(test)]
+    pub fn in_dir(root: &std::path::Path) -> Self {
+        Self {
+            config_file: root.join("config.json"),
+            library_file: root.join("library.json"),
+            games_dir: root.join("games"),
+            downloads_dir: root.join("downloads"),
+            prefixes_dir: root.join("prefixes"),
+        }
     }
 
     pub fn game_dir(&self, game_id: u64) -> PathBuf {

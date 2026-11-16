@@ -34,13 +34,16 @@ pub fn download(url: &str, dest: &Path) -> Result<u64> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut file = File::create(dest).with_context(|| format!("cannot create {}", dest.display()))?;
+    let mut file =
+        File::create(dest).with_context(|| format!("cannot create {}", dest.display()))?;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut written: u64 = 0;
     let mut last_report: u64 = 0;
     loop {
-        let n = resp.read(&mut buf).context("connection dropped mid-download")?;
+        let n = resp
+            .read(&mut buf)
+            .context("connection dropped mid-download")?;
         if n == 0 {
             break;
         }
@@ -60,7 +63,12 @@ pub fn download(url: &str, dest: &Path) -> Result<u64> {
 fn print_progress(done: u64, total: Option<u64>) {
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
     match total {
-        Some(t) if t > 0 => eprint!("\r  {:.1} / {:.1} MiB ({}%)   ", mib(done), mib(t), done * 100 / t),
+        Some(t) if t > 0 => eprint!(
+            "\r  {:.1} / {:.1} MiB ({}%)   ",
+            mib(done),
+            mib(t),
+            done * 100 / t
+        ),
         _ => eprint!("\r  {:.1} MiB   ", mib(done)),
     }
 }
@@ -116,7 +124,8 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut f = File::create(&out).with_context(|| format!("cannot create {}", out.display()))?;
+        let mut f =
+            File::create(&out).with_context(|| format!("cannot create {}", out.display()))?;
         io::copy(&mut entry, &mut f)?;
 
         // Keep the executable bit: native Linux builds need it.
@@ -145,9 +154,12 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
 /// Locates the file to launch inside an extracted build.
 ///
 /// `wanted` comes from the launch option and is relative to the build root,
-/// possibly with Windows `\` separators. If the exact path isn't there (some
+/// possibly with Windows `\\` separators. If the exact path isn't there (some
 /// archives wrap everything in one extra folder), we look for a file whose path
-/// ends the same way, then for one with the same file name.
+/// ends with the same whole path components, then for one with the same file
+/// name. Matching is case-insensitive. When several files match, the
+/// shallowest one wins (ties broken alphabetically), so the result doesn't
+/// depend on directory listing order.
 pub fn find_executable(root: &Path, wanted: &str) -> Option<PathBuf> {
     let wanted = wanted.replace('\\', "/");
     let wanted = wanted.trim_start_matches("./");
@@ -158,10 +170,15 @@ pub fn find_executable(root: &Path, wanted: &str) -> Option<PathBuf> {
     }
 
     let wanted_lower = wanted.to_lowercase();
-    let wanted_name = Path::new(wanted).file_name()?.to_string_lossy().to_lowercase();
+    let wanted_suffix = format!("/{wanted_lower}");
+    let wanted_name = Path::new(wanted)
+        .file_name()?
+        .to_string_lossy()
+        .to_lowercase();
 
     let mut files = Vec::new();
     walk(root, &mut files);
+    files.sort_by_cached_key(|p| (p.components().count(), p.clone()));
 
     let rel = |p: &PathBuf| {
         p.strip_prefix(root)
@@ -172,17 +189,62 @@ pub fn find_executable(root: &Path, wanted: &str) -> Option<PathBuf> {
     };
     files
         .iter()
-        .find(|p| rel(p).ends_with(&wanted_lower))
+        .find(|p| {
+            let r = rel(p);
+            r == wanted_lower || r.ends_with(&wanted_suffix)
+        })
         .or_else(|| {
-            files
-                .iter()
-                .find(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()) == Some(wanted_name.clone()))
+            files.iter().find(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_lowercase())
+                    .as_deref()
+                    == Some(&wanted_name)
+            })
         })
         .cloned()
 }
 
+/// Replaces `dest` with the fully prepared `staging` directory.
+///
+/// The old install is moved aside first and only deleted once the new one is
+/// in place, so if anything fails the previous install is put back.
+pub fn swap_into_place(staging: &Path, dest: &Path) -> Result<()> {
+    let backup = sibling(dest, "old");
+    if backup.exists() {
+        fs::remove_dir_all(&backup).context("could not clear an old backup folder")?;
+    }
+    let had_old = dest.exists();
+    if had_old {
+        fs::rename(dest, &backup).context("could not move the previous install aside")?;
+    }
+    if let Err(e) = fs::rename(staging, dest) {
+        if had_old {
+            let _ = fs::rename(&backup, dest);
+        }
+        return Err(e).context("could not move the new install into place");
+    }
+    if had_old {
+        // The new install works either way; a leftover backup is only clutter.
+        let _ = fs::remove_dir_all(&backup);
+    }
+    Ok(())
+}
+
+/// `games/123` -> `games/123.<suffix>`, on the same filesystem so renames
+/// are cheap and atomic.
+pub fn sibling(dir: &Path, suffix: &str) -> PathBuf {
+    let mut name = dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{suffix}"));
+    dir.with_file_name(name)
+}
+
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         // file_type() doesn't follow symlinks, so a symlink loop can't trap us.
@@ -222,6 +284,51 @@ mod tests {
     }
 
     #[test]
+    fn suffix_match_respects_path_boundaries() {
+        let root = scratch("boundary");
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::write(root.join("a/mygame.exe"), b"x").unwrap();
+        // `game.exe` must not match `mygame.exe`.
+        assert!(find_executable(&root, "game.exe").is_none());
+        // `bin/game.exe` must not match `foobin/game.exe`.
+        fs::create_dir_all(root.join("foobin")).unwrap();
+        fs::write(root.join("foobin/game.exe"), b"x").unwrap();
+        let found = find_executable(&root, "bin/game.exe").unwrap();
+        // Only the file-name fallback can find it, and it does.
+        assert!(found.ends_with("foobin/game.exe"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prefers_shallowest_match() {
+        let root = scratch("shallow");
+        fs::create_dir_all(root.join("wrap/extras/old")).unwrap();
+        fs::write(root.join("wrap/extras/old/Game.exe"), b"x").unwrap();
+        fs::write(root.join("wrap/Game.exe"), b"x").unwrap();
+        let found = find_executable(&root, "Game.exe").unwrap();
+        assert!(found.ends_with("wrap/Game.exe"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn swap_replaces_and_cleans_up() {
+        let root = scratch("swap");
+        let dest = root.join("123");
+        let staging = sibling(&dest, "new");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("old.txt"), b"old").unwrap();
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join("new.txt"), b"new").unwrap();
+
+        swap_into_place(&staging, &dest).unwrap();
+        assert!(dest.join("new.txt").is_file());
+        assert!(!dest.join("old.txt").exists());
+        assert!(!staging.exists());
+        assert!(!sibling(&dest, "old").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn zip_roundtrip_keeps_exec_bit_and_blocks_traversal() {
         use zip::write::FileOptions;
         let root = scratch("zip");
@@ -242,7 +349,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(out.join("run.sh")).unwrap().permissions().mode();
+            let mode = fs::metadata(out.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o111, 0o111);
         }
         let _ = fs::remove_dir_all(&root);

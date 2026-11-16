@@ -42,11 +42,18 @@ pub struct Package {
     pub title: Option<String>,
 }
 
+impl Package {
+    pub fn display_title(&self) -> String {
+        match self.title.as_deref() {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => format!("package {}", self.id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     pub id: u64,
-    #[serde(default)]
-    pub game_package_id: u64,
     #[serde(default)]
     pub version_number: String,
     /// The official client sorts releases by this ascending and takes the
@@ -76,10 +83,6 @@ pub struct Build {
     #[serde(default, deserialize_with = "lenient_bool")]
     pub os_windows_64: bool,
     #[serde(default, deserialize_with = "lenient_bool")]
-    pub os_mac: bool,
-    #[serde(default, deserialize_with = "lenient_bool")]
-    pub os_mac_64: bool,
-    #[serde(default, deserialize_with = "lenient_bool")]
     pub os_linux: bool,
     #[serde(default, deserialize_with = "lenient_bool")]
     pub os_linux_64: bool,
@@ -91,8 +94,6 @@ pub struct Build {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuildFile {
-    #[serde(default)]
-    pub filename: Option<String>,
     #[serde(default)]
     pub filesize: Option<u64>,
 }
@@ -118,6 +119,14 @@ impl Build {
     /// still-processing builds are skipped.
     pub fn is_active(&self) -> bool {
         self.status.is_empty() || self.status == "active"
+    }
+}
+
+impl Release {
+    /// Missing status counts as published; "hidden" and "removed" releases
+    /// are skipped.
+    pub fn is_published(&self) -> bool {
+        self.status.is_empty() || self.status == "published"
     }
 }
 

@@ -70,7 +70,8 @@ fn windows_command(game: &InstalledGame, config: &Config, paths: &Paths) -> Resu
             let mut c = Command::new("umu-run");
             // GAMEID "umu-0" means "no game-specific fixes". PROTONPATH picks
             // the Proton build; umu fetches GE-Proton if given that name.
-            c.env("GAMEID", "umu-0").env("PROTONPATH", &config.proton_path);
+            c.env("GAMEID", "umu-0")
+                .env("PROTONPATH", &config.proton_path);
             c
         }
         Runner::Wine => Command::new("wine"),

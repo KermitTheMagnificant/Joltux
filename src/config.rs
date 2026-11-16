@@ -1,6 +1,7 @@
 //! User settings, stored as JSON in the config directory.
 
 use std::fs;
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,12 +54,26 @@ impl Config {
         if let Some(parent) = paths.config_file.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&paths.config_file, serde_json::to_string_pretty(self)?)?;
+        // The file may hold the session cookie, so it's created owner-only
+        // from the start (no window where it's world-readable), written to a
+        // temp file and renamed over the old one. Renaming also replaces any
+        // older config that had looser permissions.
+        let tmp = paths.config_file.with_extension("json.tmp");
+        let _ = fs::remove_file(&tmp);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&paths.config_file, fs::Permissions::from_mode(0o600))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("cannot create {}", tmp.display()))?;
+        file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &paths.config_file).context("could not save config file")?;
         Ok(())
     }
 
@@ -73,7 +88,11 @@ impl Config {
             }
             "proton_path" => self.proton_path = value.to_string(),
             "session_cookie" => {
-                self.session_cookie = if value.is_empty() { None } else { Some(value.to_string()) }
+                self.session_cookie = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
             }
             other => bail!("unknown setting `{other}` (try: runner, proton_path, session_cookie)"),
         }
@@ -82,10 +101,48 @@ impl Config {
 
     /// Settings for display, with the cookie hidden.
     pub fn redacted(&self) -> String {
-        let cookie = if self.session_cookie.is_some() { "(set)" } else { "(not set)" };
+        let cookie = if self.session_cookie.is_some() {
+            "(set)"
+        } else {
+            "(not set)"
+        };
         format!(
             "runner         = {:?}\nproton_path    = {}\nsession_cookie = {}",
             self.runner, self.proton_path, cookie
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_config_is_owner_only_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("joltux-test-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let paths = Paths::in_dir(&dir);
+        // Simulate an older, world-readable config file.
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&paths.config_file, "{}").unwrap();
+
+        let mut config = Config::default();
+        config.set("session_cookie", "secret").unwrap();
+        config.set("runner", "wine").unwrap();
+        config.save(&paths).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&paths.config_file)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.session_cookie.as_deref(), Some("secret"));
+        assert_eq!(loaded.runner, Runner::Wine);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

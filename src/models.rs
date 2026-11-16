@@ -413,6 +413,39 @@ pub struct InstalledGame {
     pub version: String,
     pub install_dir: std::path::PathBuf,
     pub executable: std::path::PathBuf,
+    /// The package the build came from, so updates stay on it (e.g. a demo
+    /// doesn't turn into the full game). Missing in libraries written by
+    /// older versions of Joltux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "LaunchSettings::is_empty")]
+    pub launch: LaunchSettings,
+}
+
+/// Per-game launch tweaks, on top of the global settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LaunchSettings {
+    /// Extra environment variables, e.g. `DXVK_HUD=1`. These win over the
+    /// variables Joltux sets itself.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Extra arguments passed to the game.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A command the launch is wrapped in, e.g. `gamemoderun` or
+    /// `gamescope -f --`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wrapper: Vec<String>,
+    /// Use this runner for this game instead of the global one (Windows builds only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::config::Runner>,
+}
+
+impl LaunchSettings {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 #[cfg(test)]

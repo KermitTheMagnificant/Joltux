@@ -16,6 +16,7 @@ mod runtime;
 mod select;
 mod store;
 mod theme;
+mod updates;
 
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -67,6 +68,36 @@ enum Command {
     },
     /// List installed games
     List,
+    /// Check installed games for newer builds
+    Outdated,
+    /// Update installed games to their newest build (all of them if no IDs are given)
+    Upgrade {
+        /// Game IDs (see `joltux list`)
+        game_ids: Vec<u64>,
+    },
+    /// Show or change a game's launch options (with no flags, shows them)
+    Options {
+        /// Game ID (see `joltux list`)
+        game_id: u64,
+        /// Set an environment variable, e.g. --env DXVK_HUD=1 (repeatable)
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Remove an environment variable set with --env (repeatable)
+        #[arg(long, value_name = "KEY")]
+        unset_env: Vec<String>,
+        /// Arguments passed to the game, e.g. --args="-windowed -nosound" ("" clears)
+        #[arg(long, allow_hyphen_values = true)]
+        args: Option<String>,
+        /// Command to wrap the launch in, e.g. --wrapper="gamescope -f --" ("" clears)
+        #[arg(long, allow_hyphen_values = true)]
+        wrapper: Option<String>,
+        /// Runner for this Windows game: umu, wine, or default (use the global setting)
+        #[arg(long)]
+        runner: Option<String>,
+        /// Clear all of this game's launch options (applied before other flags)
+        #[arg(long)]
+        reset: bool,
+    },
     /// Log in to Game Jolt
     Login,
     /// Log out of Game Jolt
@@ -127,6 +158,28 @@ fn run() -> Result<()> {
         } => cmd_install(&paths, &game, windows, package.as_deref(), build),
         Command::Run { game_id } => cmd_run(&paths, game_id),
         Command::List => cmd_list(&paths),
+        Command::Outdated => cmd_outdated(&paths),
+        Command::Upgrade { game_ids } => cmd_upgrade(&paths, &game_ids),
+        Command::Options {
+            game_id,
+            env,
+            unset_env,
+            args,
+            wrapper,
+            runner,
+            reset,
+        } => cmd_options(
+            &paths,
+            game_id,
+            OptionChanges {
+                env,
+                unset_env,
+                args,
+                wrapper,
+                runner,
+                reset,
+            },
+        ),
         Command::Login => cmd_login(&paths),
         Command::Logout => cmd_logout(&paths),
         Command::Update { force } => cmd_update(force),
@@ -314,6 +367,8 @@ fn cmd_install(
     let executable = dir.join(relative_exe);
 
     let mut library = Library::load(paths)?;
+    // Reinstalls and upgrades keep the game's launch options.
+    let launch = library.find(id).map(|g| g.launch.clone()).unwrap_or_default();
     library.upsert(InstalledGame {
         game_id: id,
         title: title.clone(),
@@ -322,6 +377,8 @@ fn cmd_install(
         version,
         install_dir: dir,
         executable,
+        package_id: Some(choice.build.game_package_id),
+        launch,
     });
     library.save(paths)?;
     println!("Done. Play with: joltux run {id}");
@@ -343,9 +400,199 @@ fn cmd_list(paths: &Paths) -> Result<()> {
         println!("No games installed. Try: joltux install <game id or URL>");
     }
     for g in &library.games {
-        println!("{:>8}  {}  [{}]", g.game_id, g.title, describe(g.platform));
+        let tweaked = if g.launch.is_empty() { "" } else { "  (custom launch options)" };
+        println!("{:>8}  {}  [{}]{tweaked}", g.game_id, g.title, describe(g.platform));
     }
     Ok(())
+}
+
+/// Checks every installed game, printing one line each. Returns the games
+/// that have an update.
+fn check_all(paths: &Paths) -> Result<Vec<(InstalledGame, updates::Update)>> {
+    let library = Library::load(paths)?;
+    if library.games.is_empty() {
+        println!("No games installed.");
+        return Ok(Vec::new());
+    }
+    let config = Config::load(paths)?;
+    let api = ApiClient::new(config.session_cookie.as_deref())?;
+    let mut found = Vec::new();
+    for game in library.games {
+        match updates::check(&api, &game) {
+            Ok(Some(update)) => {
+                println!(
+                    "{} ({}): {} -> {} (build {})",
+                    game.title,
+                    game.game_id,
+                    version_label(&game.version),
+                    version_label(&update.version),
+                    update.build_id
+                );
+                found.push((game, update));
+            }
+            Ok(None) => println!("{} ({}): up to date", game.title, game.game_id),
+            Err(e) => println!("{} ({}): could not check ({e:#})", game.title, game.game_id),
+        }
+    }
+    Ok(found)
+}
+
+fn version_label(version: &str) -> String {
+    match version.trim().trim_start_matches('v') {
+        "" => "unknown version".to_owned(),
+        v => format!("v{v}"),
+    }
+}
+
+fn cmd_outdated(paths: &Paths) -> Result<()> {
+    let found = check_all(paths)?;
+    match found.len() {
+        0 => {}
+        1 => println!("1 update available. Install it with: joltux upgrade {}", found[0].0.game_id),
+        n => println!("{n} updates available. Install them with: joltux upgrade"),
+    }
+    Ok(())
+}
+
+fn cmd_upgrade(paths: &Paths, game_ids: &[u64]) -> Result<()> {
+    let pending = if game_ids.is_empty() {
+        check_all(paths)?
+    } else {
+        let library = Library::load(paths)?;
+        let config = Config::load(paths)?;
+        let api = ApiClient::new(config.session_cookie.as_deref())?;
+        let mut pending = Vec::new();
+        for &id in game_ids {
+            let game = library
+                .find(id)
+                .with_context(|| format!("game {id} is not installed (see `joltux list`)"))?;
+            match updates::check(&api, game)? {
+                Some(update) => pending.push((game.clone(), update)),
+                None => println!("{} is already up to date.", game.title),
+            }
+        }
+        pending
+    };
+    if pending.is_empty() {
+        println!("Nothing to update.");
+        return Ok(());
+    }
+
+    let mut failed = Vec::new();
+    for (game, update) in &pending {
+        println!();
+        let result = cmd_install(
+            paths,
+            &game.game_id.to_string(),
+            game.platform == Platform::Windows,
+            Some(&update.package_id.to_string()),
+            Some(update.build_id),
+        );
+        if let Err(e) = result {
+            eprintln!("error: could not update {}: {e:#}", game.title);
+            failed.push(game.title.as_str());
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} of {} updates failed: {}", failed.len(), pending.len(), failed.join(", "));
+    }
+    Ok(())
+}
+
+struct OptionChanges {
+    env: Vec<String>,
+    unset_env: Vec<String>,
+    args: Option<String>,
+    wrapper: Option<String>,
+    runner: Option<String>,
+    reset: bool,
+}
+
+impl OptionChanges {
+    fn is_empty(&self) -> bool {
+        self.env.is_empty()
+            && self.unset_env.is_empty()
+            && self.args.is_none()
+            && self.wrapper.is_none()
+            && self.runner.is_none()
+            && !self.reset
+    }
+}
+
+fn cmd_options(paths: &Paths, game_id: u64, changes: OptionChanges) -> Result<()> {
+    let mut library = Library::load(paths)?;
+    let game = library
+        .find_mut(game_id)
+        .with_context(|| format!("game {game_id} is not installed (see `joltux list`)"))?;
+
+    if !changes.is_empty() {
+        // Validate everything before changing anything.
+        let set: Vec<(String, String)> =
+            changes.env.iter().map(|e| launch::parse_env(e)).collect::<Result<_>>()?;
+        let args = changes.args.as_deref().map(launch::split_words).transpose()?;
+        let wrapper = changes.wrapper.as_deref().map(launch::split_words).transpose()?;
+        let runner = match changes.runner.as_deref() {
+            None => None,
+            Some(_) if game.platform == Platform::Linux => {
+                bail!("{} is a native Linux build; --runner only applies to Windows builds", game.title)
+            }
+            Some("default") => Some(None),
+            Some("umu") => Some(Some(config::Runner::Umu)),
+            Some("wine") => Some(Some(config::Runner::Wine)),
+            Some(other) => bail!("runner must be `umu`, `wine` or `default`, not `{other}`"),
+        };
+
+        let launch = &mut game.launch;
+        if changes.reset {
+            *launch = Default::default();
+        }
+        for key in &changes.unset_env {
+            if launch.env.remove(key).is_none() {
+                eprintln!("note: {key} was not set");
+            }
+        }
+        launch.env.extend(set);
+        if let Some(args) = args {
+            launch.args = args;
+        }
+        if let Some(wrapper) = wrapper {
+            launch.wrapper = wrapper;
+        }
+        if let Some(runner) = runner {
+            launch.runner = runner;
+        }
+        library.save(paths)?;
+        println!("Saved.");
+    }
+
+    let game = library.find(game_id).expect("game is still in the library");
+    print_launch_options(game, &Config::load(paths)?);
+    Ok(())
+}
+
+fn print_launch_options(game: &InstalledGame, config: &Config) {
+    let launch = &game.launch;
+    println!("Launch options for {} ({}):", game.title, game.game_id);
+    if game.platform == Platform::Windows {
+        let runner = match launch.runner {
+            Some(r) => format!("{r:?} (this game only)").to_lowercase(),
+            None => format!("{:?} (global setting)", config.runner).to_lowercase(),
+        };
+        println!("  runner:  {runner}");
+    }
+    let or_none = |words: &[String]| {
+        if words.is_empty() { "(none)".to_owned() } else { launch::join_words(words) }
+    };
+    println!("  wrapper: {}", or_none(&launch.wrapper));
+    println!("  args:    {}", or_none(&launch.args));
+    if launch.env.is_empty() {
+        println!("  env:     (none)");
+    } else {
+        println!("  env:");
+        for (key, value) in &launch.env {
+            println!("    {key}={value}");
+        }
+    }
 }
 
 fn cmd_login(paths: &Paths) -> Result<()> {

@@ -38,6 +38,10 @@ impl Library {
         self.games.iter().find(|g| g.game_id == game_id)
     }
 
+    pub fn find_mut(&mut self, game_id: u64) -> Option<&mut InstalledGame> {
+        self.games.iter_mut().find(|g| g.game_id == game_id)
+    }
+
     /// Insert, or replace the existing entry for the same game.
     pub fn upsert(&mut self, game: InstalledGame) {
         self.games.retain(|g| g.game_id != game.game_id);

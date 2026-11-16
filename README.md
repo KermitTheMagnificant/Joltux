@@ -20,6 +20,13 @@ joltux install <id> --build 987654    # pick an exact build listed by `joltux in
 joltux list                           # installed games
 joltux run     <game id>              # launch (native, or through Proton/Wine)
 joltux uninstall <game id> [--prefix] # remove game (and optionally its Wine prefix)
+joltux outdated                       # check installed games for newer builds
+joltux upgrade [game id ...]          # update those games (all outdated ones if no IDs)
+joltux options <game id>              # show a game's launch options; flags below change them
+joltux options <id> --env DXVK_HUD=fps --unset-env KEY
+joltux options <id> --args="-windowed" --wrapper="gamescope -f --"   # "" clears
+joltux options <id> --runner umu|wine|default   # per-game runner (Windows builds)
+joltux options <id> --reset
 joltux login                          # sign in to Game Jolt
 joltux logout                         # remove the saved login
 joltux update                         # install the latest version from GitHub
@@ -98,6 +105,28 @@ you launch a Windows game. Setup supports Debian/Ubuntu (`apt`), Fedora/RHEL
 administrator authentication. Python 3 with `venv` support is required for the
 user-local umu installation.
 
+## Game updates
+
+`joltux outdated` asks Game Jolt whether each installed game has a newer
+build, and `joltux upgrade` installs it. An update stays on the package
+(e.g. "Demo") and platform you installed; a different build of the release
+you already have doesn't count. The desktop Library checks once when you
+open it and shows an **Update** button on games that have one.
+
+Games installed before Joltux recorded packages are matched to their package
+automatically when possible; if a game has several packages and its old build
+is gone, reinstall it once with `--package`.
+
+## Per-game launch options
+
+Each game can have its own environment variables, game arguments, a wrapper
+command (such as `gamemoderun`, `mangohud`, or `gamescope -f --`) and, for
+Windows builds, its own runner. The launch becomes
+`[wrapper] [umu-run | wine] game [args]`, and the game's variables override
+the ones Joltux sets (so `PROTONPATH` can pick a different Proton per game).
+Set them with `joltux options` or the gear button on a Library row. They are
+kept when the game is reinstalled or updated.
+
 ## Status: what is and isn't verified
 
 Verified here (unit tests + smoke tests with fake games):
@@ -131,7 +160,7 @@ that uses it.
   feeds, friends, achievements, and messaging are not connected.
 - **Build formats:** .zip and .tar.gz archives, plus standalone Windows .exe
   files. Installer builds are not installable.
-- **No game updates / no resume** of interrupted downloads. A failed
+- **No resume** of interrupted downloads. A failed
   reinstall does leave the previous install working: new files go to a
   temporary folder and are only swapped in once the executable is found.
 - **No installer (.msi/setup.exe) builds**, same as the official client.
@@ -142,13 +171,14 @@ that uses it.
 Sources live in `src/`; icons in `assets/`.
 
 ```
-main.rs     CLI (clap) and the install/run/list/uninstall commands
+main.rs     CLI (clap) and the install/run/list/upgrade/options/uninstall commands
 gui.rs      desktop client UI for Store search, local library, installation, account, and settings
 api.rs      Game Jolt site API client
 models.rs   serde types for API responses + the installed-game record
 select.rs   which build to install (native Linux first, then Windows; --package/--build)
 install.rs  download, extract, locate the executable, swap new installs into place
-launch.rs   run natively or through umu-run / wine
+launch.rs   run natively or through umu-run / wine, with per-game options
+updates.rs  find newer builds of installed games
 runtime.rs  install umu-launcher and system Wine; configure GE-Proton
 config.rs   settings (runner, proton path, session cookie)
 library.rs  installed-games list

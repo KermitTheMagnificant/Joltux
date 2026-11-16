@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -8,13 +9,15 @@ use eframe::egui;
 
 use crate::api::{ApiClient, LoginOutcome};
 use crate::config::{Config, Runner};
+use crate::launch;
 use crate::library::Library;
-use crate::models::InstalledGame;
+use crate::models::{InstalledGame, LaunchSettings};
 use crate::paths::Paths;
 use crate::runtime;
 use crate::select::Platform;
 use crate::store::{Store, StoreAction};
 use crate::theme::{self, icon, AccentButton};
+use crate::updates::{self, Update};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -75,6 +78,57 @@ enum TaskMessage {
     Done(String),
 }
 
+/// Result of checking the whole library for updates.
+struct UpdateReport {
+    found: HashMap<u64, Update>,
+    /// Games that couldn't be checked (offline, removed from Game Jolt, ...).
+    failed: usize,
+}
+
+/// The launch options of one game, as text while being edited.
+struct LaunchEditor {
+    game_id: u64,
+    runner: Option<Runner>,
+    wrapper: String,
+    args: String,
+    /// One KEY=VALUE per line.
+    env: String,
+}
+
+impl LaunchEditor {
+    fn new(game: &InstalledGame) -> Self {
+        let launch = &game.launch;
+        Self {
+            game_id: game.game_id,
+            runner: launch.runner,
+            wrapper: launch::join_words(&launch.wrapper),
+            args: launch::join_words(&launch.args),
+            env: launch
+                .env
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    fn settings(&self) -> Result<LaunchSettings> {
+        let env = self
+            .env
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(launch::parse_env)
+            .collect::<Result<_>>()?;
+        Ok(LaunchSettings {
+            env,
+            args: launch::split_words(&self.args).context("game arguments")?,
+            wrapper: launch::split_words(&self.wrapper).context("wrapper command")?,
+            runner: self.runner,
+        })
+    }
+}
+
 pub fn run() -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -116,6 +170,15 @@ struct JoltuxApp {
     login_password: String,
     cookie_input: String,
     show_cookie: bool,
+    /// Newer builds of installed games, by game ID.
+    updates: HashMap<u64, Update>,
+    /// Set while an update check runs in the background.
+    update_check: Option<Receiver<UpdateReport>>,
+    /// The library is checked once automatically, the first time it's shown.
+    updates_checked: bool,
+    /// Outcome of the last update check, shown above the library.
+    update_note: String,
+    launch_editor: Option<LaunchEditor>,
 }
 
 impl JoltuxApp {
@@ -147,7 +210,95 @@ impl JoltuxApp {
             login_password: String::new(),
             cookie_input: String::new(),
             show_cookie: false,
+            updates: HashMap::new(),
+            update_check: None,
+            updates_checked: false,
+            update_note: String::new(),
+            launch_editor: None,
         })
+    }
+
+    /// Checks every installed game for a newer build on a background thread.
+    fn check_updates(&mut self) {
+        if self.update_check.is_some() || self.games.is_empty() {
+            return;
+        }
+        self.updates_checked = true;
+        let games = self.games.clone();
+        let session = self.config.session_cookie.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.update_check = Some(receiver);
+        std::thread::spawn(move || {
+            let mut report = UpdateReport { found: HashMap::new(), failed: games.len() };
+            if let Ok(api) = ApiClient::new(session.as_deref()) {
+                report.failed = 0;
+                for game in &games {
+                    match updates::check(&api, game) {
+                        Ok(Some(update)) => {
+                            report.found.insert(game.game_id, update);
+                        }
+                        Ok(None) => {}
+                        Err(_) => report.failed += 1,
+                    }
+                }
+            }
+            let _ = sender.send(report);
+        });
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(receiver) = &self.update_check else { return };
+        let report = match receiver.try_recv() {
+            Ok(report) => report,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => UpdateReport { found: HashMap::new(), failed: self.games.len() },
+        };
+        self.update_check = None;
+        self.updates = report.found;
+        self.forget_applied_updates();
+        let found = self.updates.len();
+        let mut note = match found {
+            0 => "Everything is up to date".to_owned(),
+            1 => "1 update available".to_owned(),
+            n => format!("{n} updates available"),
+        };
+        if report.failed > 0 {
+            note = format!(
+                "{note} · couldn't check {} game{}",
+                report.failed,
+                if report.failed == 1 { "" } else { "s" }
+            );
+        }
+        self.update_note = note;
+    }
+
+    /// Drops updates for games that were since updated or removed.
+    fn forget_applied_updates(&mut self) {
+        let games = &self.games;
+        self.updates.retain(|id, update| {
+            games.iter().any(|g| g.game_id == *id && g.build_id != update.build_id)
+        });
+    }
+
+    fn save_launch_options(&mut self) {
+        let Some(editor) = &self.launch_editor else { return };
+        let game_id = editor.game_id;
+        let result = editor.settings().and_then(|settings| {
+            let mut library = Library::load(&self.paths)?;
+            let game = library.find_mut(game_id).context("the game is no longer installed")?;
+            game.launch = settings;
+            let title = game.title.clone();
+            library.save(&self.paths)?;
+            Ok(title)
+        });
+        match result {
+            Ok(title) => {
+                self.status = format!("Saved launch options for {title}.");
+                self.launch_editor = None;
+                self.refresh();
+            }
+            Err(error) => self.status = format!("Could not save launch options: {error:#}"),
+        }
     }
 
     fn navigate_to(&mut self, page: Page) {
@@ -197,7 +348,10 @@ impl JoltuxApp {
 
     fn refresh(&mut self) {
         match Library::load(&self.paths) {
-            Ok(library) => self.games = library.games,
+            Ok(library) => {
+                self.games = library.games;
+                self.forget_applied_updates();
+            }
             Err(error) => self.status = format!("Could not reload library: {error:#}"),
         }
         match Config::load(&self.paths) {
@@ -252,15 +406,40 @@ impl JoltuxApp {
             return;
         }
 
+        if !self.updates_checked {
+            self.check_updates();
+        }
         ui.horizontal(|ui| {
             let count = self.games.len();
             ui.label(
                 egui::RichText::new(format!("{count} game{} installed", if count == 1 { "" } else { "s" }))
                     .color(theme::TEXT_DIM),
             );
+            if self.update_check.is_some() {
+                ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_DIM));
+                ui.label(egui::RichText::new("Checking for updates...").small().color(theme::TEXT_DIM));
+            } else if !self.update_note.is_empty() {
+                let color = if self.updates.is_empty() { theme::TEXT_DIM } else { theme::AMBER };
+                ui.label(egui::RichText::new(format!("·  {}", self.update_note)).small().color(color));
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(!self.busy, egui::Button::new("Refresh")).clicked() {
                     self.refresh();
+                }
+                let idle = !self.busy && self.update_check.is_none();
+                if ui.add_enabled(idle, egui::Button::new("Check for updates")).clicked() {
+                    self.check_updates();
+                }
+                if !self.updates.is_empty() {
+                    let label = format!("Update all ({})", self.updates.len());
+                    if ui.add_enabled(idle, AccentButton::new(label)).clicked() {
+                        let mut args = vec!["upgrade".to_owned()];
+                        args.extend(self.updates.keys().map(u64::to_string));
+                        self.run_cli(args);
+                        if self.busy {
+                            self.status = "Updating games...".into();
+                        }
+                    }
                 }
             });
         });
@@ -335,6 +514,21 @@ impl JoltuxApp {
                             }
                             self.run_cli(args);
                         }
+                        let editing = self.launch_editor.as_ref().is_some_and(|e| e.game_id == game.game_id);
+                        let options = egui::Button::new(icon::SETTINGS).selected(editing);
+                        if ui.add(options).on_hover_text("Launch options").clicked() {
+                            self.launch_editor = (!editing).then(|| LaunchEditor::new(game));
+                        }
+                        if let Some(update) = self.updates.get(&game.game_id) {
+                            let button = egui::Button::new(egui::RichText::new("Update").color(theme::AMBER));
+                            let hover = format!("Install {} (build {})", version_text(&update.version), update.build_id);
+                            if ui.add_enabled(!self.busy, button).on_hover_text(hover).clicked() {
+                                self.run_cli(vec!["upgrade".into(), game.game_id.to_string()]);
+                                if self.busy {
+                                    self.status = format!("Updating {}...", game.title);
+                                }
+                            }
+                        }
                         // Whatever is left belongs to the title, which truncates.
                         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
@@ -349,13 +543,14 @@ impl JoltuxApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 theme::badge(ui, if linux { "Linux" } else { "Windows · Proton/Wine" }, tint);
-                                let version = if game.version.is_empty() {
-                                    "version unknown".to_owned()
-                                } else {
-                                    format!("v{}", game.version.trim_start_matches('v'))
-                                };
+                                if let Some(update) = self.updates.get(&game.game_id) {
+                                    theme::badge(ui, &format!("{} available", version_text(&update.version)), theme::AMBER);
+                                }
+                                if !game.launch.is_empty() {
+                                    theme::badge(ui, "Custom launch", theme::TEXT_DIM);
+                                }
                                 ui.label(
-                                    egui::RichText::new(format!("{version}  ·  ID {}", game.game_id))
+                                    egui::RichText::new(format!("{}  ·  ID {}", version_text(&game.version), game.game_id))
                                         .small()
                                         .color(theme::TEXT_DIM),
                                 );
@@ -363,10 +558,80 @@ impl JoltuxApp {
                         });
                     });
                 });
+                if self.launch_editor.as_ref().is_some_and(|e| e.game_id == game.game_id) {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    self.launch_editor_ui(ui, game);
+                }
             })
             .response;
         let hovered = ui.rect_contains_pointer(response.rect);
         ui.ctx().data_mut(|data| data.insert_temp(id, hovered));
+    }
+
+    /// The launch options form shown under a library row.
+    fn launch_editor_ui(&mut self, ui: &mut egui::Ui, game: &InstalledGame) {
+        let (mut save, mut cancel) = (false, false);
+        let busy = self.busy;
+        let global = self.config.runner;
+        let Some(editor) = &mut self.launch_editor else { return };
+        ui.add_space(4.0);
+        if game.platform == Platform::Windows {
+            theme::caption(ui, "Run this game with");
+            let global_label = match global {
+                Runner::Umu => "Global (umu)",
+                Runner::Wine => "Global (Wine)",
+            };
+            theme::segmented(
+                ui,
+                "launch_runner",
+                &mut editor.runner,
+                &[(None, global_label), (Some(Runner::Umu), "umu / Proton"), (Some(Runner::Wine), "Wine")],
+            );
+            ui.add_space(2.0);
+        }
+        theme::caption(ui, "Wrapper command");
+        ui.add(
+            theme::field(&mut editor.wrapper)
+                .hint_text("e.g. gamemoderun, mangohud, gamescope -f --")
+                .desired_width(f32::INFINITY),
+        );
+        theme::caption(ui, "Game arguments");
+        ui.add(
+            theme::field(&mut editor.args)
+                .hint_text("e.g. -windowed")
+                .desired_width(f32::INFINITY),
+        );
+        theme::caption(ui, "Environment variables, one KEY=VALUE per line");
+        ui.add(
+            egui::TextEdit::multiline(&mut editor.env)
+                .margin(egui::Margin::symmetric(10, 7))
+                .hint_text(if game.platform == Platform::Windows {
+                    "DXVK_HUD=fps\nPROTON_USE_WINED3D=1"
+                } else {
+                    "SDL_VIDEODRIVER=x11"
+                })
+                .font(egui::TextStyle::Monospace)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            save = ui.add_enabled(!busy, AccentButton::new("Save")).clicked();
+            cancel = ui.button("Cancel").clicked();
+            if ui.button("Clear all").clicked() {
+                editor.runner = None;
+                editor.wrapper.clear();
+                editor.args.clear();
+                editor.env.clear();
+            }
+            ui.label(egui::RichText::new("Used the next time you press Play.").small().color(theme::TEXT_DIM));
+        });
+        if save {
+            self.save_launch_options();
+        } else if cancel {
+            self.launch_editor = None;
+        }
     }
 
     fn install_page(&mut self, ui: &mut egui::Ui) {
@@ -756,6 +1021,13 @@ impl JoltuxApp {
     }
 }
 
+fn version_text(version: &str) -> String {
+    match version.trim().trim_start_matches('v') {
+        "" => "version unknown".to_owned(),
+        v => format!("v{v}"),
+    }
+}
+
 /// Whether a finished command's message reports a failure.
 fn is_failure(status: &str) -> bool {
     ["Command failed", "Error:", "Login failed", "Could not", "Enter both"]
@@ -778,6 +1050,10 @@ impl eframe::App for JoltuxApp {
             self.refresh();
         }
         self.store.poll();
+        self.poll_update_check();
+        if self.update_check.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         if self.store.is_loading() {
             // Loading placeholders pulse, so keep drawing frames.
             ctx.request_repaint();
